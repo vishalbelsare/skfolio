@@ -1,17 +1,20 @@
 """Maximum Diversification Optimization estimator."""
 
-# Copyright (c) 2023
-# Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# Copyright (c) 2023-2026
+# Author: Hugo Delatte <hugo.delatte@skfoliolabs.com>
+# SPDX-License-Identifier: BSD-3-Clause
+
+from __future__ import annotations
 
 import numpy as np
-import numpy.typing as npt
+import sklearn.utils.validation as skv
 
 import skfolio.typing as skt
 from skfolio.measures import RiskMeasure
 from skfolio.optimization.convex._base import ObjectiveFunction
 from skfolio.optimization.convex._mean_risk import MeanRisk
 from skfolio.prior import BasePrior
+from skfolio.typing import ArrayLike
 
 
 class MaximumDiversification(MeanRisk):
@@ -28,8 +31,8 @@ class MaximumDiversification(MeanRisk):
     ----------
     prior_estimator : BasePrior, optional
         :ref:`Prior estimator <prior>`.
-        The prior estimator is used to estimate the :class:`~skfolio.prior.PriorModel`
-        containing the estimation of assets expected returns, covariance matrix,
+        The prior estimator is used to estimate the :class:`~skfolio.prior.ReturnDistribution`
+        containing estimates of expected asset returns, covariance matrix,
         returns and Cholesky decomposition of the covariance.
         The default (`None`) is to use :class:`~skfolio.prior.EmpiricalPrior`.
 
@@ -38,7 +41,7 @@ class MaximumDiversification(MeanRisk):
         If a float is provided, it is applied to each asset.
         `None` is equivalent to `-np.Inf` (no lower bound).
         If a dictionary is provided, its (key/value) pair must be the
-        (asset name/asset minium weight) and the input `X` of the `fit` method must
+        (asset name/asset minimum weight) and the input `X` of the `fit` method must
         be a DataFrame with the assets names in columns.
         When using a dictionary, assets values that are not provided are assigned
         a minimum weight of `0.0`.
@@ -76,7 +79,7 @@ class MaximumDiversification(MeanRisk):
         all weights). `None` means no budget constraints.
         The default value is `1.0` (fully invested portfolio).
 
-        Examples:
+        For example:
 
              * `budget = 1` --> fully invested portfolio.
              * `budget = 0` --> market neutral portfolio.
@@ -102,6 +105,36 @@ class MaximumDiversification(MeanRisk):
         weights.
         The default (`None`) means no maximum long position.
 
+    cardinality : int, optional
+        Specifies the cardinality constraint to limit the number of invested assets
+        (non-zero weights). This feature requires a mixed-integer solver. For an
+        open-source option, we recommend using SCIP by setting `solver="SCIP"`.
+        To install it, use: `pip install cvxpy[SCIP]`. For commercial solvers,
+        supported options include MOSEK, GUROBI, or CPLEX.
+
+    group_cardinalities : dict[str, int], optional
+        A dictionary specifying cardinality constraints for specific groups of assets.
+        The keys represent group names (strings), and the values specify the maximum
+        number of assets allowed in each group. You must provide the groups using the
+        `groups` parameter. This requires a mixed-integer solver (see `cardinality`
+        for more details).
+
+    threshold_long : float | dict[str, float] | array-like of shape (n_assets, ), optional
+        Specifies the minimum weight threshold for assets in the portfolio to be
+        considered as a long position. Assets with weights below this threshold
+        will not be included as part of the portfolio's long positions. This
+        constraint can help eliminate insignificant allocations.
+        This requires a mixed-integer solver (see `cardinality` for more details).
+        It follows the same format as `min_weights` and `max_weights`.
+
+    threshold_short : float | dict[str, float] | array-like of shape (n_assets, ), optional
+        Specifies the maximum weight threshold for assets in the portfolio to be
+        considered as a short position. Assets with weights above this threshold
+        will not be included as part of the portfolio's short positions. This
+        constraint can help control the magnitude of short positions.
+        This requires a mixed-integer solver (see `cardinality` for more details).
+        It follows the same format as `min_weights` and `max_weights`.
+
     transaction_costs : float | dict[str, float] | array-like of shape (n_assets, ), default=0.0
         Transaction costs of the assets. It is used to add linear transaction costs to
         the optimization problem:
@@ -114,8 +147,14 @@ class MaximumDiversification(MeanRisk):
 
         .. math:: expected\_return = \mu^{T} \cdot w - total\_cost
 
-        with :math:`\mu` the vector af assets' expected returns and :math:`w` the
+        with :math:`\mu` the vector of assets' expected returns and :math:`w` the
         vector of assets weights.
+
+        For positions in `previous_weights` whose assets are no longer in the
+        investment universe, transaction costs are calculated assuming full
+        liquidation. These costs are included in both the optimization and
+        `Portfolio.total_cost`. For assets absent from `X`, `transaction_costs`
+        must be a single rate applied to all assets or a dictionary keyed by asset name.
 
         If a float is provided, it is applied to each asset.
         If a dictionary is provided, its (key/value) pair must be the
@@ -126,10 +165,14 @@ class MaximumDiversification(MeanRisk):
         .. warning::
 
             Based on the above formula, the periodicity of the transaction costs
-            needs to be homogenous to the periodicity of :math:`\mu`. For example, if
-            the input `X` is composed of **daily** returns, the `transaction_costs` need
-            to be expressed as **daily** costs.
-            (See :ref:`sphx_glr_auto_examples_1_mean_risk_plot_6_transaction_costs.py`)
+            must match the periodicity of :math:`\mu`. For example, if the input
+            `X` is composed of **daily** returns, the `transaction_costs` need to be
+            expressed as **daily** costs. A transaction cost is paid once per
+            rebalancing while a position earns its expected return on every period it
+            is held, so the one-off cost is converted by dividing it by the expected
+            investment duration (e.g. `0.001 / 21` for a 10 bps cost with daily
+            returns and a one-month expected holding period).
+            (See :ref:`Periodicity Convention <periodicity_convention>`)
 
     management_fees : float | dict[str, float] | array-like of shape (n_assets, ), default=0.0
         Management fees of the assets. It is used to add linear management fees to the
@@ -142,7 +185,7 @@ class MaximumDiversification(MeanRisk):
 
         .. math:: expected\_return = \mu^{T} \cdot w - total\_fee
 
-        with :math:`\mu` the vector af assets expected returns and :math:`w` the vector
+        with :math:`\mu` the vector of assets' expected returns and :math:`w` the vector
         of assets weights.
 
         If a float is provided, it is applied to each asset.
@@ -153,10 +196,13 @@ class MaximumDiversification(MeanRisk):
 
         .. warning::
 
-            Based on the above formula, the periodicity of the management fees needs to
-            be homogenous to the periodicity of :math:`\mu`. For example, if the input
+            Based on the above formula, the periodicity of the management fees
+            must match the periodicity of :math:`\mu`. For example, if the input
             `X` is composed of **daily** returns, the `management_fees` need to be
-            expressed in **daily** fees.
+            expressed in **daily** fees. Unlike transaction costs, management fees
+            accrue with holding time, so a stated annual fee converts directly to the
+            return periodicity (e.g. `0.02 / 252` for a 2% annual fee on daily
+            returns).
 
         .. note::
 
@@ -169,11 +215,15 @@ class MaximumDiversification(MeanRisk):
     previous_weights : float | dict[str, float] | array-like of shape (n_assets, ), optional
         Previous weights of the assets. Previous weights are used to compute the
         portfolio cost and the portfolio turnover.
+        For named positions in assets absent from `X`, these calculations assume
+        full liquidation.
         If a float is provided, it is applied to each asset.
         If a dictionary is provided, its (key/value) pair must be the
         (asset name/asset previous weight) and the input `X` of the `fit` method must
         be a DataFrame with the assets names in columns.
         The default (`None`) means no previous weights.
+        Additionally, when `fallback="previous_weights"`, failures will fall back to
+        these weights if provided.
 
     l1_coef : float, default=0.0
         L1 regularization coefficient.
@@ -196,26 +246,37 @@ class MaximumDiversification(MeanRisk):
         The default value is `0.0`.
 
     linear_constraints : array-like of shape (n_constraints,), optional
-        Linear constraints.
-        The linear constraints must match any of following patterns:
+        Linear constraints on portfolio weights or factor exposures.
 
-           * "2.5 * ref1 + 0.10 * ref2 + 0.0013 <= 2.5 * ref3"
-           * "ref1 >= 2.9 * ref2"
-           * "ref1 <= ref2"
-           * "ref1 >= ref1"
+        Constraint names can reference:
 
-        With "ref1", "ref2" ... the assets names or the groups names provided
-        in the parameter `groups`. Assets names can be referenced without the need of
-        `groups` if the input `X` of the `fit` method is a DataFrame with these
-        assets names in columns.
+            * Asset names: individual asset weights (e.g. `"SPX"`, `"AAPL"`)
+            * Group names: sums of weights in groups defined by `groups`
+            * Factor names: portfolio factor exposure (requires factor model prior)
+            * Factor families: sum of portfolio exposures to all factors in one family
 
-        Examples:
+        Supported equation patterns include:
 
-            * "SPX >= 0.10" --> SPX weight must be greater than 10% (note that you can also use `min_weights`)
-            * "SX5E + TLT >= 0.2" --> the sum of SX5E and TLT weights must be greater than 20%
-            * "US >= 0.7" --> the sum of all US weights must be greater than 70%
-            * "Equity <= 3 * Bond" --> the sum of all Equity weights must be less or equal to 3 times the sum of all Bond weights.
-            * "2*SPX + 3*Europe <= Bond + 0.05" --> mixing assets and group constraints
+            * `"name <= value"` or `"name >= value"`
+            * `"name == value"`
+            * `"a * name1 + b * name2 <= c * name3 + d"`
+
+        For example:
+
+            * `"SPX >= 0.10"` --> SPX weight >= 10%
+            * `"SX5E + SPX >= 0.2"` --> sum of SX5E and SPX weights >= 20%
+            * `"US == 0.7"` --> sum of weights in US group == 70%
+            * `"Equity == 3 * Bond"` --> sum of weights in Equity group == 3x sum of weights in Bond group
+            * `"Momentum <= 0.30"` --> portfolio Momentum exposure <= 30%
+            * `"style <= 0.50"` --> sum of all style factor exposures (Momentum, Value, Size, etc.) <= 50%
+
+        Factor constraints require a prior estimator (e.g.
+        :class:`~skfolio.prior.TimeSeriesFactorModel`,
+        :class:`~skfolio.prior.CharacteristicsFactorModel`)
+        that provides `loading_matrix`, `factor_names` and optionally `factor_families`
+        in its :class:`~skfolio.prior.FactorModel`.
+
+        Asset, group, factor, and factor family names must be unique.
 
     groups : dict[str, list[str]] or array-like of shape (n_groups, n_assets), optional
         The assets groups referenced in `linear_constraints`.
@@ -223,10 +284,10 @@ class MaximumDiversification(MeanRisk):
         (asset name/asset groups) and the input `X` of the `fit` method must be a
         DataFrame with the assets names in columns.
 
-        Examples:
+        For example:
 
-            * groups = {"SX5E": ["Equity", "Europe"], "SPX": ["Equity", "US"], "TLT": ["Bond", "US"]}
-            * groups = [["Equity", "Equity", "Bond"], ["Europe", "US", "US"]]
+            * `groups = {"SX5E": ["Equity", "Europe"], "SPX": ["Equity", "US"], "TLT": ["Bond", "US"]}`
+            * `groups = [["Equity", "Equity", "Bond"], ["Europe", "US", "US"]]`
 
     left_inequality : array-like of shape (n_constraints, n_assets), optional
         Left inequality matrix :math:`A` of the linear
@@ -243,17 +304,15 @@ class MaximumDiversification(MeanRisk):
     max_tracking_error : float, optional
         Upper bound constraint on the tracking error.
         The tracking error is defined as the RMSE (root-mean-square error) of the
-        portfolio returns compared to a target returns. If `max_tracking_error` is
+        portfolio returns compared to target returns. If `max_tracking_error` is
         provided, the target returns `y` must be provided in the `fit` method.
 
     max_turnover : float, optional
-        Upper bound constraint of the turnover.
-        The turnover is defined as the absolute difference between the portfolio weights
-        and the `previous_weights`. Note that another way to control for turnover is by
-        using the `transaction_costs` parameter.
-
-    min_return : float | array-like of shape (n_optimization), optional
-        Lower bound constraint on the expected return.
+        Upper bound on each investable asset's absolute weight change from
+        `previous_weights`. For positions outside the investment universe,
+        transaction costs and the predicted portfolio's `turnover` are calculated
+        assuming full liquidation, without applying this limit. Transaction costs
+        can also be used to control turnover.
 
     min_return : float | array-like of shape (n_optimization), optional
         Lower bound constraint on the expected return.
@@ -263,10 +322,32 @@ class MaximumDiversification(MeanRisk):
         It is a function that must take as argument the weights `w` and returns a
         CVXPY expression.
 
-    add_constraints : Callable[[cp.Variable], cp.Expression|list[cp.Expression]], optional
+    add_constraints : Callable[[cp.Variable], cp.Expression | list[cp.Expression]], optional
         Add a custom constraint or a list of constraints to the existing constraints.
-        It is a function that must take as argument the weights `w` and returns a
-        CVPXY expression or a list of CVPXY expressions.
+        It must be a function taking the CVXPY weight variable `w` as its first
+        positional argument and, optionally, the estimator instance as its second.
+        It must return a CVXPY expression or a list of CVXPY expressions, evaluated
+        when `fit` is called.
+
+        For example, to require an effective number of assets of at least 20:
+
+        >>> import cvxpy as cp
+        >>> from skfolio.optimization import MaximumDiversification
+        >>> model = MaximumDiversification(
+        ...     add_constraints=lambda w: cp.sum_squares(w) <= 1 / 20
+        ... )
+
+        The optional second argument gives access to the estimator's attributes,
+        including quantities estimated during `fit`. For example, to cap each
+        position size in risk units at 20 bps, using the volatilities estimated
+        by the prior:
+
+        >>> import numpy as np
+        >>> def position_risk_cap(w, model):
+        ...     covariance = model.prior_estimator_.return_distribution_.covariance
+        ...     vols = np.sqrt(np.diag(covariance))
+        ...     return cp.multiply(vols, w) <= 0.002
+        >>> model = MaximumDiversification(add_constraints=position_risk_cap)
 
     solver : str, default="CLARABEL"
         The solver to use. The default is "CLARABEL" which is written in Rust and has
@@ -296,15 +377,29 @@ class MaximumDiversification(MeanRisk):
         If this is set to True, the CVXPY Problem is saved in `problem_`.
         The default is `False`.
 
-    raise_on_failure : bool, default=True
-        If this is set to True, an error is raised when the optimization fail otherwise
-        it passes with a warning.
+    portfolio_params : dict, optional
+        Portfolio parameters forwarded to the resulting `Portfolio` in `predict`.
+        If not provided and if available on the estimator, the following
+        attributes are propagated to the portfolio by default: `name`,
+        `transaction_costs`, `management_fees`, `previous_weights` and `risk_free_rate`.
 
-    portfolio_params :  dict, optional
-        Portfolio parameters passed to the portfolio evaluated by the `predict` and
-        `score` methods. If not provided, the `name`, `transaction_costs`,
-        `management_fees`, `previous_weights` and `risk_free_rate` are copied from the
-        optimization model and passed to the portfolio.
+    fallback : BaseOptimization | "previous_weights" | list[BaseOptimization | "previous_weights"], optional
+        Fallback estimator or a list of estimators to try, in order, when the primary
+        optimization raises during `fit`. Alternatively, use `"previous_weights"`
+        (alone or in a list) to fall back to the estimator's `previous_weights`.
+        When a fallback succeeds, its fitted `weights_` are copied back to the primary
+        estimator so that `fit` still returns the original instance. For traceability,
+        `fallback_` stores the successful estimator (or the string `"previous_weights"`)
+        and `fallback_chain_` stores each attempt with the associated outcome.
+
+    raise_on_failure : bool, default=True
+        Controls error handling when fitting fails.
+        If True, any failure during `fit` is raised immediately, no `weights_` are
+        set and subsequent calls to `predict` will raise a `NotFittedError`.
+        If False, errors are not raised; instead, a warning is emitted, `weights_`
+        is set to `None` and subsequent calls to `predict` will return a
+        `FailedPortfolio`. When fallbacks are specified, this behavior applies only
+        after all fallbacks have been exhausted.
 
     Attributes
     ----------
@@ -327,6 +422,58 @@ class MaximumDiversification(MeanRisk):
     feature_names_in_ : ndarray of shape (`n_features_in_`,)
         Names of assets seen during `fit`. Defined only when `X`
         has assets names that are all strings.
+
+    fallback_ : BaseOptimization | "previous_weights" | None
+        The fallback estimator instance, or the string `"previous_weights"`, that
+        produced the final result. `None` if no fallback was used.
+
+    fallback_chain_ : list[tuple[str, str]] | None
+        Sequence describing the optimization fallback attempts. Each element is a
+        pair `(estimator_repr, outcome)` where `estimator_repr` is the string
+        representation of the primary estimator or a fallback (e.g. `"EqualWeighted()"`,
+        `"previous_weights"`), and `outcome` is `"success"` if that step produced
+        a valid solution, otherwise the stringified error message. For successful
+        fits without any fallback, this is `None`.
+
+    error_ : str | list[str] | None
+        Captured error message(s) when `fit` fails. For multi-portfolio outputs
+        (`weights_` is 2D), this is a list aligned with portfolios.
+
+    Notes
+    -----
+    All estimators should specify all parameters as explicit keyword arguments in
+    `__init__` (no `*args` or `**kwargs`), following scikit-learn conventions.
+
+    Examples
+    --------
+    For a complete tutorial on maximum diversification optimization, see the
+    :ref:`maximum_diversification_examples` gallery.
+
+    >>> from skfolio.datasets import load_sp500_dataset
+    >>> from skfolio.optimization import MaximumDiversification
+    >>> from skfolio.preprocessing import prices_to_returns
+    >>>
+    >>> # Load historical prices and convert them to returns
+    >>> prices = load_sp500_dataset()
+    >>> X = prices_to_returns(prices)
+    >>>
+    >>> # Maximum diversification optimization
+    >>> model = MaximumDiversification()
+    >>> model.fit(X)
+    MaximumDiversification()
+    >>> print(model.weights_)
+    [0.0821 0.0697 0.0243 ... 0.0945 0.0893 0.0143]
+    >>>
+    >>> portfolio = model.predict(X)
+    >>> print(portfolio.diversification)
+    1.87...
+    >>>
+    >>> # Limit each asset to 8% of the portfolio
+    >>> model = MaximumDiversification(max_weights=0.08)
+    >>> model.fit(X)
+    MaximumDiversification(max_weights=0.08)
+    >>> print(model.weights_)
+    [0.08   0.0706 0.0288 ... 0.08   0.08   0.0289]
     """
 
     def __init__(
@@ -339,6 +486,10 @@ class MaximumDiversification(MeanRisk):
         max_budget: float | None = None,
         max_short: float | None = None,
         max_long: float | None = None,
+        cardinality: int | None = None,
+        group_cardinalities: dict[str, int] | None = None,
+        threshold_long: skt.MultiInput | None = None,
+        threshold_short: skt.MultiInput | None = None,
         transaction_costs: skt.MultiInput = 0.0,
         management_fees: skt.MultiInput = 0.0,
         previous_weights: skt.MultiInput | None = None,
@@ -357,14 +508,15 @@ class MaximumDiversification(MeanRisk):
         scale_objective: float | None = None,
         scale_constraints: float | None = None,
         save_problem: bool = False,
-        raise_on_failure: bool = True,
         add_objective: skt.ExpressionFunction | None = None,
         add_constraints: skt.ExpressionFunction | None = None,
         portfolio_params: dict | None = None,
+        fallback: skt.Fallback = None,
+        raise_on_failure: bool = True,
     ):
         super().__init__(
             objective_function=ObjectiveFunction.MAXIMIZE_RATIO,
-            risk_measure=RiskMeasure.VARIANCE,
+            risk_measure=RiskMeasure.STANDARD_DEVIATION,
             prior_estimator=prior_estimator,
             min_weights=min_weights,
             max_weights=max_weights,
@@ -373,6 +525,10 @@ class MaximumDiversification(MeanRisk):
             max_budget=max_budget,
             max_short=max_short,
             max_long=max_long,
+            cardinality=cardinality,
+            group_cardinalities=group_cardinalities,
+            threshold_long=threshold_long,
+            threshold_short=threshold_short,
             transaction_costs=transaction_costs,
             management_fees=management_fees,
             previous_weights=previous_weights,
@@ -391,15 +547,16 @@ class MaximumDiversification(MeanRisk):
             scale_objective=scale_objective,
             scale_constraints=scale_constraints,
             save_problem=save_problem,
-            raise_on_failure=raise_on_failure,
             add_objective=add_objective,
             add_constraints=add_constraints,
             portfolio_params=portfolio_params,
+            fallback=fallback,
+            raise_on_failure=raise_on_failure,
         )
 
     def fit(
-        self, X: npt.ArrayLike, y: npt.ArrayLike | None = None, **fit_params
-    ) -> "MaximumDiversification":
+        self, X: ArrayLike, y: ArrayLike | None = None, **fit_params
+    ) -> MaximumDiversification:
         """Fit the Maximum Diversification Optimization estimator.
 
         Parameters
@@ -414,7 +571,7 @@ class MaximumDiversification(MeanRisk):
         **fit_params : dict
             Parameters to pass to the underlying estimators.
             Only available if `enable_metadata_routing=True`, which can be
-            set by using ``sklearn.set_config(enable_metadata_routing=True)``.
+            set by using `sklearn.set_config(enable_metadata_routing=True)`.
             See :ref:`Metadata Routing User Guide <metadata_routing>` for
             more details.
 
@@ -423,12 +580,15 @@ class MaximumDiversification(MeanRisk):
         self : MaximumDiversification
            Fitted estimator.
         """
-        self._check_feature_names(X, reset=True)
+        # `X` is unchanged and only `feature_names_in_` is performed
+        _ = skv.validate_data(self, X, skip_check_array=True)
 
         def func(w, obj):
-            """weighted volatilities"""
-            covariance = obj.prior_estimator_.prior_model_.covariance
-            return np.sqrt(np.diag(covariance)) @ w
+            """Weighted volatilities."""
+            dist = obj.prior_estimator_.return_distribution_
+            if obj.investable_mask_ is not None:
+                dist = dist.investable_subset(slim=True)
+            return np.sqrt(np.diag(dist.covariance)) @ w
 
         self.overwrite_expected_return = func
         super().fit(X, y, **fit_params)

@@ -1,44 +1,48 @@
-"""Black & Litterman Prior Model estimator."""
+"""Black & Litterman estimator."""
 
-# Copyright (c) 2023
-# Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# Copyright (c) 2023-2026
+# Author: Hugo Delatte <hugo.delatte@skfoliolabs.com>
+# SPDX-License-Identifier: BSD-3-Clause
 # Implementation derived from:
 # Riskfolio-Lib, Copyright (c) 2020-2023, Dany Cajas, Licensed under BSD 3 clause.
 # PyPortfolioOpt, Copyright (c) 2018 Robert Andrew Martin, Licensed under MIT Licence.
 
+from __future__ import annotations
+
 import numpy as np
-import numpy.typing as npt
 import sklearn.utils.metadata_routing as skm
+import sklearn.utils.validation as skv
 
 from skfolio.moments import EquilibriumMu
-from skfolio.prior._base import BasePrior, PriorModel
+from skfolio.prior._base import BasePrior
 from skfolio.prior._empirical import EmpiricalPrior
+from skfolio.prior._model import ReturnDistribution
+from skfolio.typing import ArrayLike, FloatArray, StrArray
 from skfolio.utils.equations import equations_to_matrix
 from skfolio.utils.tools import check_estimator, input_to_array
 
 
 class BlackLitterman(BasePrior):
-    """Black & Litterman Prior Model estimator.
+    """Black & Litterman estimator.
 
     The Black & Litterman model [1]_ takes a Bayesian approach by using a prior estimate
-    of the assets expected returns and covariance matrix, which are updated using the
+    of the expected asset returns and covariance matrix, which are updated using the
     analyst views to get a posterior estimate.
 
     Parameters
     ----------
     views : array-like of floats of shape (n_views,)
-        The analyst views about the assets expected returns.
+        The analyst views about the expected asset returns.
         The views must match the following patterns:
 
             * Absolute view: "asset_i = a"
             * Relative view: "asset_i - asset_j = b"
 
         With "asset_i" and "asset_j" the assets names and "a" and "b" the analyst views
-        about the assets expected returns expressed in the same frequency as the
+        about the expected asset returns expressed in the same frequency as the
         returns `X`.
 
-        Examples:
+        For example:
 
             * "SPX = 0.00015" --> the SPX will have a daily expected return of 0.015%
             * "SX5E - TLT = 0.00039" --> the SX5E will outperform the TLT by a daily expected return of 0.039%
@@ -52,15 +56,15 @@ class BlackLitterman(BasePrior):
         (asset name/asset groups) and the input `X` of the `fit` method must be a
         DataFrame with the assets names in columns.
 
-        Examples:
+        For example:
 
             * groups = {"SX5E": ["Equity", "Europe"], "SPX": ["Equity", "US"], "TLT": ["Bond", "US"]}
             * groups = [["Equity", "Equity", "Bond"], ["Europe", "US", "US"]]
 
     prior_estimator : BasePrior, optional
-        The assets' :ref:`prior model estimator <prior>`. It is used to estimate
-        the :class:`~skfolio.prior.PriorModel` containing the estimation of the assets
-        expected returns, covariance matrix, returns and Cholesky decomposition.
+        The assets' :ref:`prior estimator <prior>`. It is used to estimate
+        the :class:`~skfolio.prior.ReturnDistribution` containing estimates of
+        expected asset returns, covariance matrix, returns and Cholesky decomposition.
         The default (`None`) is to use `EmpiricalPrior(mu_estimator=EquilibriumMu())`.
 
     tau : float, default=0.05
@@ -73,15 +77,17 @@ class BlackLitterman(BasePrior):
     view_confidences : array-like of floats of shape (n_views,), optional
         Instead of using a diagonal uncertainty matrix (Omega) proportional to the prior
         covariance matrix, you can provide the vector of view confidences (between 0
-        and 1) as describe by the Idzorek's method [2]_.
+        and 1) as described in Idzorek's method [2]_.
 
     risk_free_rate : float, default=0.0
         The risk-free rate.
 
     Attributes
     ----------
-    prior_model_ : PriorModel
-        The :class:`~skfolio.prior.PriorModel`.
+    return_distribution_ : ReturnDistribution
+        Fitted :class:`~skfolio.prior.ReturnDistribution` to be used by the optimization
+        estimators, containing the asset returns distribution and posterior Black &
+        Litterman moments estimation.
 
     groups_ : ndarray of shape(n_groups, n_assets)
         Assets names and groups converted to an 2D array.
@@ -114,18 +120,20 @@ class BlackLitterman(BasePrior):
         Idzorek T, 2007.
     """
 
-    groups_: np.ndarray
-    views_: np.ndarray
-    picking_matrix_: np.ndarray
+    groups_: StrArray
+    views_: StrArray
+    picking_matrix_: FloatArray
     prior_estimator_: BasePrior
+    n_features_in_: int
+    feature_names_in_: StrArray
 
     def __init__(
         self,
-        views: npt.ArrayLike,
-        groups: dict[str, list[str]] | npt.ArrayLike | None = None,
+        views: ArrayLike,
+        groups: dict[str, list[str]] | ArrayLike | None = None,
         prior_estimator: BasePrior | None = None,
         tau: float = 0.05,
-        view_confidences: npt.ArrayLike | None = None,
+        view_confidences: ArrayLike | None = None,
         risk_free_rate: float = 0,
     ):
         self.views = views
@@ -143,7 +151,7 @@ class BlackLitterman(BasePrior):
         )
         return router
 
-    def fit(self, X: npt.ArrayLike, y=None, **fit_params) -> "BlackLitterman":
+    def fit(self, X: ArrayLike, y=None, **fit_params) -> BlackLitterman:
         """Fit the Black & Litterman estimator.
 
         Parameters
@@ -157,7 +165,7 @@ class BlackLitterman(BasePrior):
         **fit_params : dict
             Parameters to pass to the underlying estimators.
             Only available if `enable_metadata_routing=True`, which can be
-            set by using ``sklearn.set_config(enable_metadata_routing=True)``.
+            set by using `sklearn.set_config(enable_metadata_routing=True)`.
             See :ref:`Metadata Routing User Guide <metadata_routing>` for
             more details.
 
@@ -176,13 +184,13 @@ class BlackLitterman(BasePrior):
         # fitting prior estimator
         self.prior_estimator_.fit(X, y, **routed_params.prior_estimator.fit)
 
-        prior_mu = self.prior_estimator_.prior_model_.mu
-        prior_covariance = self.prior_estimator_.prior_model_.covariance
-        prior_returns = self.prior_estimator_.prior_model_.returns
+        prior_mu = self.prior_estimator_.return_distribution_.mu
+        prior_covariance = self.prior_estimator_.return_distribution_.covariance
+        prior_returns = self.prior_estimator_.return_distribution_.returns
 
         # we validate after all models have been fitted to keep features names
         # information.
-        self._validate_data(X)
+        skv.validate_data(self, X)
 
         n_assets = prior_returns.shape[1]
         views = np.asarray(self.views)
@@ -208,13 +216,16 @@ class BlackLitterman(BasePrior):
                 ),
                 name="groups",
             )
-        self.picking_matrix_, self.views_ = equations_to_matrix(
+        self.picking_matrix_, self.views_, a_ineq, _ = equations_to_matrix(
             groups=self.groups_,
             equations=views,
             sum_to_one=True,
             raise_if_group_missing=True,
             names=("groups", "views"),
         )
+
+        if len(a_ineq) != 0:
+            raise ValueError("Inequalities (<=, >=) are not supported in views")
 
         if self.view_confidences is None:
             omega = np.diag(
@@ -254,7 +265,7 @@ class BlackLitterman(BasePrior):
             + self.tau * prior_covariance
             - _v @ np.linalg.solve(_a, _v.T)
         )
-        self.prior_model_ = PriorModel(
+        self.return_distribution_ = ReturnDistribution(
             mu=posterior_mu, covariance=posterior_covariance, returns=prior_returns
         )
         return self

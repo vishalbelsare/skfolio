@@ -1,12 +1,15 @@
+from __future__ import annotations
+
 import numpy as np
 import pytest
-from sklearn import config_context
+from sklearn import clone, config_context
 
 from skfolio import ExtraRiskMeasure, RiskMeasure
 from skfolio.cluster import HierarchicalClustering, LinkageMethod
 from skfolio.moments import EWCovariance, ImpliedCovariance
 from skfolio.optimization import HierarchicalRiskParity
-from skfolio.prior import EmpiricalPrior, FactorModel
+from skfolio.prior import EmpiricalPrior, EntropyPooling, TimeSeriesFactorModel
+from skfolio.typing import FloatArray
 
 
 @pytest.fixture(scope="module")
@@ -16,7 +19,11 @@ def small_X(X):
 
 @pytest.fixture(
     scope="module",
-    params=list(RiskMeasure) + list(ExtraRiskMeasure),
+    params=[
+        x
+        for x in [*RiskMeasure, *ExtraRiskMeasure]
+        if x not in [ExtraRiskMeasure.SKEW, ExtraRiskMeasure.KURTOSIS]
+    ],
 )
 def risk_measure(request):
     return request.param
@@ -68,36 +75,36 @@ def test_hrp_empirical_prior(X):
         model.weights_,
         np.array(
             [
-                0.00923669,
-                0.00427779,
-                0.06213615,
-                0.02367877,
-                0.03596591,
-                0.02150797,
-                0.04545975,
-                0.1480145,
-                0.0800653,
-                0.04264111,
-                0.06024382,
-                0.10169225,
-                0.02671939,
-                0.07198196,
-                0.02399284,
-                0.09213609,
-                0.00500037,
-                0.0520981,
-                0.06382561,
-                0.02932562,
+                0.01307953,
+                0.00561547,
+                0.0237671,
+                0.01827471,
+                0.04254362,
+                0.04676903,
+                0.04147246,
+                0.14774962,
+                0.03007711,
+                0.06131316,
+                0.05678132,
+                0.09842512,
+                0.02390536,
+                0.06355906,
+                0.04000992,
+                0.104119,
+                0.01142646,
+                0.04965521,
+                0.07994753,
+                0.04150924,
             ]
         ),
     )
 
 
-def test_hrp_factor_model(X, y):
+def test_hrp_factor_model(X, factors):
     model = HierarchicalRiskParity(
-        risk_measure=RiskMeasure.CVAR, prior_estimator=FactorModel()
+        risk_measure=RiskMeasure.CVAR, prior_estimator=TimeSeriesFactorModel()
     )
-    model.fit(X, y)
+    model.fit(X, factors=factors)
     np.testing.assert_almost_equal(
         model.weights_,
         np.array(
@@ -153,7 +160,7 @@ def test_transaction_costs(X, previous_weights, transaction_costs):
 def test_hrp_small_X(small_X):
     model = HierarchicalRiskParity()
     model.fit(small_X)
-    assert model.hierarchical_clustering_estimator_.n_clusters_ == 1
+    assert model.hierarchical_clustering_estimator_.n_clusters_ == 2
 
 
 def test_metadata_routing(X_medium, implied_vol_medium):
@@ -173,3 +180,391 @@ def test_metadata_routing(X_medium, implied_vol_medium):
 
     # noinspection PyUnresolvedReferences
     assert model.prior_estimator_.covariance_estimator_.r2_scores_.shape == (20,)
+
+
+def test_hrp_weight_constraints(X):
+    model = HierarchicalRiskParity(
+        risk_measure=RiskMeasure.STANDARD_DEVIATION,
+    )
+    model.fit(X)
+    np.testing.assert_almost_equal(model.weights_[0], 0.030624328591088226)
+    np.testing.assert_almost_equal(model.weights_[-1], 0.05811358822991056)
+    np.testing.assert_almost_equal(sum(model.weights_), 1.0)
+
+    # Min Weights
+    model.set_params(min_weights={"AAPL": 0.05, "XOM": 0.08})
+    model.fit(X)
+    np.testing.assert_almost_equal(model.weights_[0], 0.05)
+    np.testing.assert_almost_equal(model.weights_[-1], 0.08)
+    np.testing.assert_almost_equal(sum(model.weights_), 1.0)
+
+    model.set_params(min_weights=0.05)
+    model.fit(X)
+    np.testing.assert_almost_equal(model.weights_, np.ones(20) * 0.05)
+    np.testing.assert_almost_equal(sum(model.weights_), 1.0)
+
+    # Max Weights
+    model.set_params(min_weights=0)
+    model.set_params(max_weights={"AAPL": 0.01, "XOM": 0.03})
+    model.fit(X)
+    np.testing.assert_almost_equal(model.weights_[0], 0.01)
+    np.testing.assert_almost_equal(model.weights_[-1], 0.03)
+    np.testing.assert_almost_equal(sum(model.weights_), 1.0)
+
+    model.set_params(max_weights=0.05)
+    model.fit(X)
+    np.testing.assert_almost_equal(model.weights_, np.ones(20) * 0.05)
+    np.testing.assert_almost_equal(sum(model.weights_), 1.0)
+
+    # Both
+    model.set_params(min_weights={"AAPL": 0.05}, max_weights={"XOM": 0.03})
+    model.fit(X)
+    np.testing.assert_almost_equal(model.weights_[0], 0.05)
+    np.testing.assert_almost_equal(model.weights_[-1], 0.03)
+    np.testing.assert_almost_equal(sum(model.weights_), 1.0)
+
+    model.set_params(min_weights=0.03, max_weights=0.06)
+    model.fit(X)
+    np.testing.assert_almost_equal(
+        model.weights_,
+        np.array(
+            [
+                0.03,
+                0.03,
+                0.03,
+                0.04712633,
+                0.05191067,
+                0.06,
+                0.06,
+                0.06,
+                0.03,
+                0.06,
+                0.06,
+                0.06,
+                0.04068081,
+                0.06,
+                0.05825588,
+                0.06,
+                0.03115588,
+                0.05087043,
+                0.06,
+                0.06,
+            ]
+        ),
+    )
+    np.testing.assert_almost_equal(sum(model.weights_), 1.0)
+
+
+def test_hrp_weight_constraints_rand(X, risk_measure, linkage_method):
+    X = X.iloc[-100:, :6]
+    model = HierarchicalRiskParity(
+        risk_measure=risk_measure,
+        hierarchical_clustering_estimator=HierarchicalClustering(
+            linkage_method=linkage_method
+        ),
+    )
+    np.random.seed(42)
+    for _ in range(5):
+        min_weights, max_weights = _random_weights_bounds(n_assets=X.shape[1])
+        model.set_params(min_weights=min_weights, max_weights=max_weights)
+        model.fit(X)
+        assert np.all(model.weights_ - min_weights >= -1e-8)
+        assert np.all(model.weights_ - max_weights <= 1e-8)
+
+
+def _random_weights_bounds(n_assets: int) -> tuple[FloatArray, FloatArray]:
+    raw_min = np.random.rand(n_assets)
+    min_total_target = np.random.rand()
+    min_weights = raw_min / raw_min.sum() * min_total_target
+    required_diff = max(0.0, 1.0 - min_weights.sum())
+    raw_diff = np.random.rand(n_assets)
+    extra_factor = 1 + np.random.rand()
+    diff_total_target = required_diff * extra_factor
+    diff_weights = raw_diff / raw_diff.sum() * diff_total_target
+    max_weights = min_weights + diff_weights
+
+    assert min_weights.sum() <= 1.0 <= max_weights.sum()
+    assert np.all(min_weights >= 0) and np.all(max_weights >= min_weights)
+    return min_weights, max_weights
+
+
+def test_optim_with_equal_weighted_sample_weight(X, risk_measure):
+    """No sample weight and equal-weighted sample weight should give the same result"""
+    ref = HierarchicalRiskParity(risk_measure=risk_measure)
+    ref.fit(X)
+
+    model = HierarchicalRiskParity(
+        risk_measure=risk_measure, prior_estimator=EntropyPooling()
+    )
+    model.fit(X)
+
+    np.testing.assert_almost_equal(model.weights_, ref.weights_, 6)
+
+
+@pytest.mark.parametrize(
+    "risk_measure,view_params,expected_weights",
+    [
+        (
+            RiskMeasure.CVAR,
+            dict(cvar_views=["PG == 0.07"]),
+            [
+                0.03027,
+                0.02001,
+                0.02843,
+                0.0395,
+                0.06506,
+                0.05026,
+                0.05525,
+                0.07618,
+                0.03398,
+                0.02855,
+                0.06198,
+                0.09286,
+                0.05971,
+                0.02579,
+                0.03679,
+                0.05522,
+                0.06274,
+                0.03062,
+                0.06962,
+                0.07718,
+            ],
+        ),
+        (
+            RiskMeasure.MEAN_ABSOLUTE_DEVIATION,
+            dict(variance_views=["PG == 0.005"]),
+            [
+                0.0277,
+                0.02219,
+                0.02003,
+                0.04551,
+                0.06187,
+                0.05937,
+                0.06236,
+                0.08268,
+                0.02079,
+                0.04072,
+                0.05868,
+                0.11017,
+                0.05035,
+                0.02928,
+                0.03423,
+                0.05856,
+                0.03092,
+                0.03031,
+                0.06729,
+                0.08699,
+            ],
+        ),
+        (
+            RiskMeasure.VARIANCE,
+            dict(variance_views=["PG == 0.0005"]),
+            [
+                0.02842,
+                0.01042,
+                0.01369,
+                0.03213,
+                0.04311,
+                0.0486,
+                0.06607,
+                0.10018,
+                0.01568,
+                0.06346,
+                0.05743,
+                0.12451,
+                0.04033,
+                0.03559,
+                0.0416,
+                0.06218,
+                0.01176,
+                0.0317,
+                0.08565,
+                0.0875,
+            ],
+        ),
+        (
+            RiskMeasure.STANDARD_DEVIATION,
+            dict(variance_views=["PG == 0.0005"]),
+            [
+                0.03053,
+                0.01848,
+                0.02181,
+                0.0464,
+                0.05477,
+                0.05728,
+                0.06654,
+                0.08196,
+                0.02334,
+                0.04593,
+                0.06176,
+                0.09094,
+                0.05255,
+                0.0344,
+                0.03727,
+                0.06489,
+                0.02751,
+                0.03254,
+                0.07604,
+                0.07504,
+            ],
+        ),
+        (
+            RiskMeasure.SEMI_DEVIATION,
+            dict(variance_views=["PG == 0.0005"]),
+            [
+                0.02992,
+                0.01775,
+                0.0269,
+                0.04208,
+                0.05807,
+                0.05386,
+                0.05962,
+                0.08176,
+                0.03087,
+                0.0359,
+                0.06373,
+                0.08529,
+                0.05585,
+                0.03192,
+                0.03929,
+                0.06744,
+                0.03824,
+                0.03242,
+                0.07893,
+                0.07014,
+            ],
+        ),
+        (
+            RiskMeasure.SEMI_VARIANCE,
+            dict(variance_views=["PG == 0.0005"]),
+            [
+                0.02918,
+                0.01027,
+                0.02065,
+                0.02768,
+                0.04791,
+                0.04389,
+                0.05557,
+                0.10503,
+                0.02721,
+                0.0383,
+                0.06376,
+                0.11418,
+                0.04856,
+                0.03028,
+                0.04887,
+                0.06736,
+                0.02149,
+                0.03327,
+                0.09425,
+                0.07229,
+            ],
+        ),
+        (
+            RiskMeasure.FIRST_LOWER_PARTIAL_MOMENT,
+            dict(variance_views=["PG == 0.005"]),
+            [
+                0.0277,
+                0.02219,
+                0.02003,
+                0.04551,
+                0.06187,
+                0.05937,
+                0.06236,
+                0.08268,
+                0.02079,
+                0.04072,
+                0.05868,
+                0.11017,
+                0.05035,
+                0.02928,
+                0.03423,
+                0.05856,
+                0.03092,
+                0.03031,
+                0.06729,
+                0.08699,
+            ],
+        ),
+    ],
+)
+def test_sample_weight(X, risk_measure, view_params, expected_weights):
+    ref = HierarchicalRiskParity(risk_measure=risk_measure)
+    ref.fit(X)
+
+    model = clone(ref)
+    model = model.set_params(prior_estimator=EntropyPooling(**view_params))
+    model.fit(X)
+
+    assert model.weights_[15] < ref.weights_[15]
+
+    np.testing.assert_almost_equal(model.weights_, expected_weights, 5)
+
+    ref_ptf = ref.predict(X)
+    ptf = model.predict(X)
+
+    assert getattr(ref_ptf, risk_measure.value) < getattr(ptf, risk_measure.value)
+
+    sample_weight = model.prior_estimator_.return_distribution_.sample_weight
+
+    ref_ptf.sample_weight = sample_weight
+    ptf.sample_weight = sample_weight
+
+    assert getattr(ref_ptf, risk_measure.value) > getattr(ptf, risk_measure.value)
+
+
+def test_hrp_invalid_risk_measure_type(small_X):
+    model = HierarchicalRiskParity().set_params(risk_measure="variance")
+    with pytest.raises(
+        TypeError, match="must be of type `RiskMeasure` or `ExtraRiskMeasure`"
+    ):
+        model.fit(small_X)
+
+
+@pytest.mark.parametrize(
+    "risk_measure", [ExtraRiskMeasure.SKEW, ExtraRiskMeasure.KURTOSIS]
+)
+def test_hrp_unsupported_risk_measure(small_X, risk_measure):
+    model = HierarchicalRiskParity(risk_measure=risk_measure)
+    with pytest.raises(ValueError, match="currently not supported in HRP"):
+        model.fit(small_X)
+
+
+def test_hrp_none_weight_bounds(small_X):
+    model = HierarchicalRiskParity(min_weights=None, max_weights=None)
+    model.fit(small_X)
+    assert np.all(model.weights_ >= 0)
+    np.testing.assert_almost_equal(np.sum(model.weights_), 1.0)
+
+
+@pytest.mark.parametrize(
+    "params,error,match",
+    [
+        (dict(min_weights=-0.1), ValueError, "`min_weights` must be strictly positive"),
+        (dict(min_weights=0.5), ValueError, "Invalid `min_weights`: sum is 1.5000"),
+        (
+            dict(max_weights=1.5),
+            ValueError,
+            "`max_weights` must be less than or equal to 1.0",
+        ),
+        (dict(max_weights=0.2), ValueError, "Invalid `max_weights`: sum is 0.6000"),
+        (
+            dict(min_weights={"AAPL": 0.5}, max_weights={"AAPL": 0.2}),
+            NameError,
+            (
+                "Items of `min_weights` must be less than or equal to items of"
+                " `max_weights`"
+            ),
+        ),
+    ],
+)
+def test_hrp_weight_bounds_validation(small_X, params, error, match):
+    model = HierarchicalRiskParity(**params)
+    with pytest.raises(error, match=match):
+        model.fit(small_X)
+
+
+def test_hierarchical_clean_input_none():
+    model = HierarchicalRiskParity()
+    with pytest.raises(ValueError, match="Cannot convert None to array"):
+        model._clean_input(None, n_assets=3, fill_value=0, name="min_weights")

@@ -14,10 +14,15 @@ assets returns and stores the covariance in its `covariance_` attribute.
 
 `X` can be any array-like structure (numpy array, pandas DataFrame, etc.)
 
+`covariance_` is expressed in the periodicity of `X` (daily returns give a daily
+covariance) and is consumed as is by the optimizers, without annualization (see
+:ref:`Periodicity Convention <periodicity_convention>`).
+
 
 Available estimators are:
     * :class:`EmpiricalCovariance`
     * :class:`EWCovariance`
+    * :class:`RegimeAdjustedEWCovariance`
     * :class:`GerberCovariance`
     * :class:`DenoiseCovariance`
     * :class:`DetoneCovariance`
@@ -25,6 +30,18 @@ Available estimators are:
     * :class:`OAS`
     * :class:`ShrunkCovariance`
     * :class:`GraphicalLassoCV`
+    * :class:`ImpliedCovariance`
+
+For online learning and streaming workflows, :class:`EWCovariance` and
+:class:`RegimeAdjustedEWCovariance` support incremental updates with
+`partial_fit`. They also support NaN-aware updates with `active_mask`, which
+helps distinguish assets that belong to the universe but have missing returns,
+(e.g. holidays) or assets outside the universe (e.g. during pre-listing or
+post-delisting periods).
+See :ref:`online_learning` for the full online workflow, including covariance
+forecast evaluation and online hyper-parameter tuning.
+See :ref:`Missing Data and Changing Universes <missing_data>` for the full convention
+on NaNs, universe membership, estimator warmup and investability.
 
 **Example:**
 
@@ -40,4 +57,3 @@ Available estimators are:
     model = EmpiricalCovariance()
     model.fit(X)
     print(model.covariance_)
-

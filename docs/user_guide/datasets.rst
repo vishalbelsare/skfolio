@@ -6,7 +6,7 @@
 Datasets
 ********
 
-`skfolio` comes with three natives datasets available via:
+`skfolio` comes with three native datasets available via:
 
     * :func:`load_sp500_dataset`
     * :func:`load_sp500_index`
@@ -17,16 +17,29 @@ directory. They are available via:
 
     * :func:`load_ftse100_dataset`
     * :func:`load_nasdaq_dataset`
+    * :func:`load_sp500_implied_vol_dataset`
 
 By default the data directory is set to a folder named "skfolio_data" in the user home
 folder. Alternatively, it can be set by the `SKFOLIO_DATA` environment variable.
 If the folder does not already exist, it is automatically created.
 
+For characteristics-based factor models, :func:`make_synthetic_characteristics`
+generates a synthetic :class:`~skfolio.containers.AssetPanel` with the market and
+fundamental fields used by the default descriptors and
+:class:`~skfolio.prior.CharacteristicsFactorModel`. Use it for examples, tests, and
+local prototyping when you do not have a point-in-time fundamentals feed.
+
+.. caution::
+    This dataset is provided solely for testing and example purposes. It is a stale
+    dataset and does not reflect current or accurate market prices. It is not
+    intended for investment, trading, or commercial use and should not be relied
+    upon as authoritative market data.
 
 **Example:**
 
-Loading the SPX 500 dataset, which is composed of the daily prices of 20 assets from the
-S&P 500 composition starting from 1990-01-02 up to 2022-12-28:
+Loading the S&P 500 dataset, which contains daily adjusted closing prices for 20
+selected constituents of the S&P 500 Index, covering the period from 1990-01-02 to
+2022-12-28:
 
 .. code-block:: python
 
@@ -35,9 +48,11 @@ S&P 500 composition starting from 1990-01-02 up to 2022-12-28:
     prices = load_sp500_dataset()
     print(prices.head())
 
+Generating a synthetic characteristics panel:
 
-The data comes from the Yahoo public API.
-The price is the adjusted close which is the closing price after adjustments for
-all applicable splits and dividend distributions.
-The adjustment uses appropriate split and dividend multipliers, adhering to
-the Center for Research in Security Prices (CRSP) standards.
+.. code-block:: python
+
+    from skfolio.datasets import make_synthetic_characteristics
+
+    panel = make_synthetic_characteristics(n_assets=200, n_observations=1000)
+    print(panel.n_assets, panel.n_observations)

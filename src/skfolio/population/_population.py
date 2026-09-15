@@ -2,11 +2,14 @@
 A population is a collection of portfolios.
 """
 
-# Copyright (c) 2023
-# Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# Copyright (c) 2023-2026
+# Author: Hugo Delatte <hugo.delatte@skfoliolabs.com>
+# SPDX-License-Identifier: BSD-3-Clause
+
+from __future__ import annotations
 
 import inspect
+import warnings
 from typing import Any
 
 import numpy as np
@@ -16,9 +19,12 @@ import plotly.graph_objects as go
 import scipy.interpolate as sci
 
 import skfolio.typing as skt
-from skfolio.portfolio import BasePortfolio, MultiPeriodPortfolio
-from skfolio.utils.sorting import non_denominated_sort
-from skfolio.utils.tools import deduplicate_names
+from skfolio.measures import BaseMeasure, RatioMeasure
+from skfolio.portfolio import BasePortfolio, FailedPortfolio, MultiPeriodPortfolio
+from skfolio.typing import FloatArray, IntArray
+from skfolio.utils.figure import kde_trace
+from skfolio.utils.sorting import non_dominated_sort
+from skfolio.utils.tools import deduplicate_names, optimal_rounding_decimals
 
 
 class Population(list):
@@ -44,7 +50,7 @@ class Population(list):
 
     def __getitem__(
         self, indices: int | list[int] | slice
-    ) -> "BasePortfolio | Population":
+    ) -> BasePortfolio | Population:
         item = super().__getitem__(indices)
         if isinstance(item, list):
             return self.__class__(item)
@@ -53,7 +59,7 @@ class Population(list):
     def __setitem__(self, index: int, item: BasePortfolio) -> None:
         super().__setitem__(index, self._validate_item(item))
 
-    def __add__(self, other: BasePortfolio) -> "Population":
+    def __add__(self, other: BasePortfolio) -> Population:
         if not isinstance(other, Population):
             raise TypeError(
                 f"Cannot add a Population with an object of type {type(other)}"
@@ -75,7 +81,7 @@ class Population(list):
         else:
             super().extend(self._validate_item(item) for item in other)
 
-    def set_portfolio_params(self, **params: Any) -> "Population":
+    def set_portfolio_params(self, **params: Any) -> Population:
         """Set the parameters of all the portfolios.
 
         Parameters
@@ -107,6 +113,7 @@ class Population(list):
         for portfolio in self:
             for key, value in params.items():
                 setattr(portfolio, key, value)
+        return self
 
     @staticmethod
     def _validate_item(
@@ -121,7 +128,129 @@ class Population(list):
             f", got {type(item).__name__}"
         )
 
-    def non_denominated_sort(self, first_front_only: bool = False) -> list[list[int]]:
+    def _validate_compounded(self) -> bool:
+        """
+        Determine whether all portfolios in the population use compounded returns.
+
+        Returns
+        -------
+        bool
+            True if all portfolios are compounded, False if all are non-compounded.
+
+        Raises
+        ------
+        ValueError
+            If the population is empty, or if it mixes compounded and non-compounded
+            portfolios.
+        """
+        compounded = [ptf.compounded for ptf in self]
+
+        if not compounded:
+            raise ValueError("Cannot determine compounded status: population is empty.")
+
+        compounded = set(compounded)
+        if len(compounded) > 1:
+            raise ValueError(
+                "Population contains a mix of compounded and non-compounded portfolios."
+                " Ensure consistency, for example with "
+                "`population.set_portfolio_params(compounded=False)`."
+            )
+
+        return compounded.pop()
+
+    def returns_df(self, use_tag_in_column_name: bool = True) -> pd.DataFrame:
+        """DataFrame of returns for each portfolio in the population.
+
+        Parameters
+        ----------
+        use_tag_in_column_name : bool, default=True
+            Whether to include the portfolio tag in the DataFrame column names.
+            If True, each column name will use the portfolio name followed by its tag;
+            if False, only the portfolio name will be used.
+
+        Returns
+        -------
+        returns : DataFrame
+            Returns DataFrame where each column represents a portfolio's returns
+            time series.
+        """
+        returns = []
+        names = []
+        for ptf in self:
+            returns.append(ptf.returns_df)
+            names.append(
+                _ptf_name_with_tag(ptf) if use_tag_in_column_name else ptf.name
+            )
+        df = pd.concat(returns, axis=1, sort=False)
+        # Sort index because pd.concat unsort NaNs at the end
+        df.sort_index(inplace=True)
+        df.columns = deduplicate_names(names)
+        return df
+
+    def cumulative_returns_df(
+        self, use_tag_in_column_name: bool = True
+    ) -> pd.DataFrame:
+        """DataFrame of cumulative returns for each portfolio in the population.
+        Non-compounded (arithmetic) cumulative returns start at 0.
+        Compounded (geometric) cumulative returns are expressed as a wealth index,
+        starting at 1.0 (i.e., the value of $1 invested).
+
+        Parameters
+        ----------
+        use_tag_in_column_name : bool, default=True
+            Whether to include the portfolio tag in the DataFrame column names.
+            If True, each column name will use the portfolio name followed by its tag;
+            if False, only the portfolio name will be used.
+
+        Returns
+        -------
+        cumulative_returns : DataFrame
+            Cumulative returns DataFrame.
+        """
+        self._validate_compounded()
+        cumulative_returns = []
+        names = []
+        for ptf in self:
+            cumulative_returns.append(ptf.cumulative_returns_df)
+            names.append(
+                _ptf_name_with_tag(ptf) if use_tag_in_column_name else ptf.name
+            )
+        df = pd.concat(cumulative_returns, axis=1, sort=False)
+        # Sort index because pd.concat unsort NaNs at the end
+        df.sort_index(inplace=True)
+        df.columns = deduplicate_names(names)
+        return df
+
+    def drawdowns_df(self, use_tag_in_column_name: bool = True) -> pd.DataFrame:
+        """DataFrame of drawdowns for each portfolio in the population.
+
+        Parameters
+        ----------
+        use_tag_in_column_name : bool, default=True
+            Whether to include the portfolio tag in the DataFrame column names.
+            If True, each column name will use the portfolio name followed by its tag;
+            if False, only the portfolio name will be used.
+
+        Returns
+        -------
+        drawdowns : DataFrame
+            Drawdowns DataFrame.
+        """
+        self._validate_compounded()
+        drawdowns = []
+        names = []
+        for ptf in self:
+            drawdowns.append(ptf.drawdowns_df)
+            names.append(
+                _ptf_name_with_tag(ptf) if use_tag_in_column_name else ptf.name
+            )
+        df = pd.concat(drawdowns, axis=1)
+        # Sort index because pd.concat unsort NaNs at the end
+        df.sort_index(inplace=True)
+        df.columns = deduplicate_names(names)
+        return df
+
+    def non_dominated_sort(self, first_front_only: bool = False) -> list[list[int]]:
         """Fast non-dominated sorting.
         Sort the portfolios into different non-domination levels.
         Complexity O(MN^2) where M is the number of objectives and N the number of
@@ -147,18 +276,34 @@ class Population(list):
             ]
         ):
             raise ValueError(
-                "Cannot compute non denominated sorting with Portfolios "
+                "Cannot compute non-dominated sorting with Portfolios "
                 "containing mixed `fitness_measures`"
             )
         fitnesses = np.array([portfolio.fitness for portfolio in self])
-        fronts = non_denominated_sort(
+        fronts = non_dominated_sort(
             fitnesses=fitnesses, first_front_only=first_front_only
         )
         return fronts
 
+    # TODO remove deprecated non_denominated_sort in v2.0
+    def non_denominated_sort(self, first_front_only: bool = False) -> list[list[int]]:
+        """Alias of :meth:`non_dominated_sort`.
+
+        .. deprecated::
+            `non_denominated_sort` is deprecated and will be removed in version 2.0.
+            Use :meth:`non_dominated_sort` instead.
+        """
+        warnings.warn(
+            "`Population.non_denominated_sort` is deprecated and will be removed in "
+            "version 2.0. Use `Population.non_dominated_sort` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        return self.non_dominated_sort(first_front_only=first_front_only)
+
     def filter(
         self, names: skt.Names | None = None, tags: skt.Tags | None = None
-    ) -> "Population":
+    ) -> Population:
         """Filter the Population of portfolios by names and tags.
         If both names and tags are provided, the intersection is returned.
 
@@ -201,94 +346,62 @@ class Population(list):
     def measures(
         self,
         measure: skt.Measure,
-        names: skt.Names | None = None,
-        tags: skt.Tags | None = None,
-    ) -> np.ndarray:
+    ) -> FloatArray:
         """Vector of portfolios measures for each portfolio from the
-        population filtered by names and tags.
+        population.
 
         Parameters
         ----------
         measure : Measure
             The portfolio measure.
-
-        names :  str | list[str], optional
-            If provided, the population is filtered by portfolio names.
-
-        tags : str | list[str], optional
-            If provided, the population is filtered by portfolio tags.
 
         Returns
         -------
         values : ndarray
             The vector of portfolios measures.
         """
-        population = self.filter(names=names, tags=tags)
-        return np.array([ptf.__getattribute__(measure.value) for ptf in population])
+        return np.array([ptf.__getattribute__(measure.value) for ptf in self])
 
     def measures_mean(
         self,
         measure: skt.Measure,
-        names: skt.Names | None = None,
-        tags: skt.Tags | None = None,
     ) -> float:
         """Mean of portfolios measures for each portfolio from the
-        population filtered by names and tags.
+        population.
 
         Parameters
         ----------
         measure : Measure
             The portfolio measure.
-
-        names :  str | list[str], optional
-           If provided, the population is filtered by portfolio names.
-
-        tags :  str | list[str], optional
-           If provided, the population is filtered by portfolio tags.
 
         Returns
         -------
         value : float
             The mean of portfolios measures.
         """
-        return self.measures(measure=measure, names=names, tags=tags).mean()
+        return np.nanmean(self.measures(measure=measure), axis=0)
 
     def measures_std(
         self,
         measure: skt.Measure,
-        names: skt.Names | None = None,
-        tags: skt.Tags | None = None,
     ) -> float:
         """Standard-deviation of portfolios measures for each portfolio from the
-        population filtered by names and tags.
+        population.
 
         Parameters
         ----------
         measure : Measure
             The portfolio measure.
 
-        names : str | list[str], optional
-            If provided, the population is filtered by portfolio names.
-
-        tags : str | list[str], optional
-            If provided, the population is filtered by portfolio tags.
-
         Returns
         -------
         value : float
             The standard-deviation of portfolios measures.
         """
-        return self.measures(measure=measure, names=names, tags=tags).std()
+        return np.nanstd(self.measures(measure=measure), axis=0)
 
-    def sort_measure(
-        self,
-        measure: skt.Measure,
-        reverse: bool = False,
-        names: skt.Names | None = None,
-        tags: skt.Tags | None = None,
-    ) -> "Population":
-        """Sort the population by a given portfolio measure and filter the portfolios
-        by names and tags.
+    def sort_measure(self, measure: skt.Measure, reverse: bool = False) -> Population:
+        """Sort the population by a given portfolio measure.
 
         Parameters
         ----------
@@ -298,21 +411,14 @@ class Population(list):
         reverse : bool, default=False
             If this is set to True, the order is reversed.
 
-        names : str | list[str], optional
-            If provided, the population is filtered by portfolio names.
-
-        tags : str | list[str], optional
-            If provided, the population is filtered by portfolio tags.
-
         Returns
         -------
         values : Populations
             The sorted population.
         """
-        population = self.filter(names=names, tags=tags)
         return self.__class__(
             sorted(
-                population,
+                [x for x in self if not isinstance(x, FailedPortfolio)],
                 key=lambda x: x.__getattribute__(measure.value),
                 reverse=reverse,
             )
@@ -322,10 +428,8 @@ class Population(list):
         self,
         measure: skt.Measure,
         q: float,
-        names: skt.Names | None = None,
-        tags: skt.Tags | None = None,
     ) -> BasePortfolio:
-        """Returns the portfolio corresponding to the `q` quantile for a given portfolio
+        """Return the portfolio corresponding to the `q` quantile for a given portfolio
         measure.
 
         Parameters
@@ -336,12 +440,6 @@ class Population(list):
         q : float
             The quantile value.
 
-        names : str | list[str], optional
-            If provided, the population is filtered by portfolio names.
-
-        tags : str | list[str], optional
-            If provided, the population is filtered by portfolio tags.
-
         Returns
         -------
         values : BasePortfolio
@@ -349,71 +447,51 @@ class Population(list):
         """
         if not 0 <= q <= 1:
             raise ValueError("The quantile`q` must be between 0 and 1")
-        sorted_portfolios = self.sort_measure(
-            measure=measure, reverse=False, names=names, tags=tags
-        )
+        sorted_portfolios = self.sort_measure(measure=measure, reverse=False)
         k = max(0, int(np.round(len(sorted_portfolios) * q)) - 1)
         return sorted_portfolios[k]
 
     def min_measure(
         self,
         measure: skt.Measure,
-        names: skt.Names | None = None,
-        tags: skt.Tags | None = None,
     ) -> BasePortfolio:
-        """Returns the portfolio with the minimum measure.
+        """Return the portfolio with the minimum measure.
 
         Parameters
         ----------
         measure : Measure
             The portfolio measure.
 
-        names : str | list[str], optional
-            If provided, the population is filtered by portfolio names.
-
-        tags : str | list[str], optional
-            If provided, the population is filtered by portfolio tags.
-
         Returns
         -------
         values : BasePortfolio
             The portfolio with minimum measure.
         """
-        return self.quantile(measure=measure, q=0, names=names, tags=tags)
+        return self.quantile(measure=measure, q=0)
 
     def max_measure(
         self,
         measure: skt.Measure,
-        names: skt.Names | None = None,
-        tags: skt.Tags | None = None,
     ) -> BasePortfolio:
-        """Returns the portfolio with the maximum measure.
+        """Return the portfolio with the maximum measure.
 
         Parameters
         ----------
         measure: Measure
             The portfolio measure.
 
-        names : str | list[str], optional
-            If provided, the population is filtered by portfolio names.
-
-        tags : str | list[str], optional
-            If provided, the population is filtered by portfolio tags.
-
         Returns
         -------
         values : BasePortfolio
             The portfolio with maximum measure.
         """
-        return self.quantile(measure=measure, q=1, names=names, tags=tags)
+        return self.quantile(measure=measure, q=1)
 
     def summary(
         self,
         formatted: bool = True,
-        names: skt.Names | None = None,
-        tags: skt.Tags | None = None,
     ) -> pd.DataFrame:
-        """Summary of the portfolios in the population
+        """Summary of the portfolios in the population.
 
         Parameters
         ----------
@@ -422,41 +500,81 @@ class Population(list):
             units.
             The default is `True`.
 
-        names : str | list[str], optional
-            If provided, the population is filtered by portfolio names.
-
-        tags : str | list[str], optional
-            If provided, the population is filtered by portfolio tags.
-
         Returns
         -------
         summary : pandas DataFrame
             The population's portfolios summary
-        """
 
-        portfolios = self.filter(names=names, tags=tags)
+        Notes
+        -----
+        This method returns a static pandas DataFrame. For interactive exploration
+        (e.g., sortable/filterable/clickable tables or visual summaries), you may want
+        to use libraries such as `ipydatagrid`, `D-Tale`, or `Lux` in a Jupyter
+        environment, or `dash_table` / `streamlit.dataframe` when building dashboards.
+        For example, you can explore the summary with D-Tale:
+        `dtale.show(population.summary().T)`
+        """
         df = pd.concat(
-            [p.summary(formatted=formatted) for p in portfolios],
-            keys=[p.name for p in portfolios],
+            [p.summary(formatted=formatted) for p in self],
+            keys=[p.name for p in self],
             axis=1,
         )
         return df
 
     def composition(
         self,
-        names: skt.Names | None = None,
-        tags: skt.Tags | None = None,
         display_sub_ptf_name: bool = True,
     ) -> pd.DataFrame:
-        """Composition of the portfolios in the population.
+        """Composition of each portfolio in the population.
 
         Parameters
         ----------
-        names : str | list[str], optional
-            If provided, the population is filtered by portfolio names.
+        display_sub_ptf_name : bool, default=True
+            If this is set to True, each sub-portfolio name composing a multi-period
+            portfolio is displayed.
 
-        tags : str | list[str], optional
-            If provided, the population is filtered by portfolio tags.
+        Returns
+        -------
+        df : DataFrame
+            Composition of the portfolios in the population.
+        """
+        res = []
+        for ptf in self:
+            comp = ptf.composition
+            if display_sub_ptf_name:
+                if isinstance(ptf, MultiPeriodPortfolio):
+                    comp.rename(
+                        columns={c: f"{ptf.name}_{c}" for c in comp.columns},
+                        inplace=True,
+                    )
+            else:
+                comp.rename(columns={c: ptf.name for c in comp.columns}, inplace=True)
+            res.append(comp)
+
+        df = pd.concat(res, axis=1)
+        # Leave columns of only NaNs untouched
+        mask = ~df.isna().all(axis=0)
+        df.loc[:, mask] = df.loc[:, mask].fillna(0)
+        df.columns = deduplicate_names(list(df.columns))
+        return df
+
+    def contribution(
+        self,
+        measure: skt.Measure,
+        spacing: float | None = None,
+        display_sub_ptf_name: bool = True,
+    ) -> pd.DataFrame:
+        r"""Contribution of each asset to a given measure of each portfolio in the
+        population.
+
+        Parameters
+        ----------
+        measure : Measure
+            The measure used for the contribution computation.
+
+        spacing : float, optional
+            Spacing "h" of the finite difference:
+            :math:`contribution(wi)= \frac{measure(wi-h) - measure(wi+h)}{2h}`.
 
         display_sub_ptf_name : bool, default=True
             If this is set to True, each sub-portfolio name composing a multi-period
@@ -464,25 +582,62 @@ class Population(list):
 
         Returns
         -------
-        summary : DataFrame
-            Composition of the portfolios in the population.
+        df : DataFrame
+            Contribution of each asset to a given measure of each portfolio in the
+            population.
         """
-        portfolios = self.filter(names=names, tags=tags)
-        comp_list = []
-        for p in portfolios:
-            comp = p.composition
+        res = []
+        for ptf in self:
+            contribution = ptf.contribution(
+                measure=measure, spacing=spacing, to_df=True
+            )
             if display_sub_ptf_name:
-                if isinstance(p, MultiPeriodPortfolio):
-                    comp.rename(
-                        columns={c: f"{p.name}_{c}" for c in comp.columns}, inplace=True
+                if isinstance(ptf, MultiPeriodPortfolio):
+                    contribution.rename(
+                        columns={c: f"{ptf.name}_{c}" for c in contribution.columns},
+                        inplace=True,
                     )
             else:
-                comp.rename(columns={c: p.name for c in comp.columns}, inplace=True)
-            comp_list.append(comp)
+                contribution.rename(
+                    columns={c: ptf.name for c in contribution.columns}, inplace=True
+                )
+            res.append(contribution)
 
-        df = pd.concat(comp_list, axis=1)
+        df = pd.concat(res, axis=1)
+        # Leave columns of only NaNs untouched
+        mask = ~df.isna().all(axis=0)
+        df.loc[:, mask] = df.loc[:, mask].fillna(0)
         df.columns = deduplicate_names(list(df.columns))
-        df.fillna(0, inplace=True)
+        return df
+
+    def rolling_measure(
+        self, measure: skt.Measure = RatioMeasure.SHARPE_RATIO, window: int = 30
+    ) -> pd.DataFrame:
+        """Compute the measure over a rolling window for each portfolio in the
+         population.
+
+        Parameters
+        ----------
+        measure : Measure, default=RatioMeasure.SHARPE_RATIO
+            The measure. The default measure is the Sharpe Ratio.
+
+        window : int, default=30
+            The window size. The default value is `30` observations.
+
+        Returns
+        -------
+        dataframe : pandas DataFrame
+            The rolling measures.
+        """
+        rolling_measures = []
+        names = []
+        for ptf in self:
+            rolling_measures.append(ptf.rolling_measure(measure=measure, window=window))
+            names.append(_ptf_name_with_tag(ptf))
+        df = pd.concat(rolling_measures, axis=1)
+        df.columns = deduplicate_names(names)
+        # Sort index because pd.concat unsort NaNs at the end
+        df.sort_index(inplace=True)
         return df
 
     def plot_distribution(
@@ -513,20 +668,36 @@ class Population(list):
         plot : Figure
             Returns the plotly Figure object.
         """
-        values = []
-        labels = []
-        for measure in measure_list:
-            if tag_list is not None:
-                for tag in tag_list:
-                    values.append(self.measures(measure=measure, tags=tag))
-                    labels.append(f"{measure} - {tag}")
-            else:
-                values.append(self.measures(measure=measure))
-                labels.append(measure.value)
+        n = len(measure_list)
 
-        df = pd.DataFrame(np.array(values).T, columns=labels).melt(
-            var_name="Population"
-        )
+        if tag_list is None:
+            df = pd.concat(
+                [
+                    pd.DataFrame(
+                        {
+                            "Population": measure.value,
+                            "value": self.measures(measure=measure),
+                        }
+                    )
+                    for measure in measure_list
+                ],
+                ignore_index=True,
+            )
+        else:
+            df = pd.concat(
+                [
+                    pd.DataFrame(
+                        {
+                            "Population": tag if n == 1 else f"{measure} - {tag}",
+                            "value": self.filter(tags=tag).measures(measure=measure),
+                        }
+                    )
+                    for measure in measure_list
+                    for tag in tag_list
+                ],
+                ignore_index=True,
+            )
+
         fig = px.histogram(
             df,
             color="Population",
@@ -535,36 +706,119 @@ class Population(list):
             nbins=n_bins,
             **kwargs,
         )
-        fig.update_layout(title_text="Measures Distribution", xaxis_title="measures")
+        title = f"{measure_list[0]} Distribution" if n == 1 else "Measures Distribution"
+        fig.update_layout(
+            title_text=title, xaxis_title=str(measure_list[0]) if n == 1 else "measures"
+        )
+        return fig
+
+    def boxplot_measure(
+        self,
+        measure: skt.Measure,
+        tag_list: list[str] | None = None,
+        points: str | bool = "all",
+    ) -> go.Figure:
+        """Plot a box plot of a measure's distribution, optionally split by tags.
+
+        If no tags are provided, the function draws a single box showing the
+        population distribution of `measure`. If `tag_list` is provided, it draws
+        one box per tag using values from the portfolio filtered by each tag.
+
+        Parameters
+        ----------
+        measure : Measure
+            The measure to plot.
+
+        tag_list : list[str], optional
+            For each tag in this list, filter the portfolio by that tag and plot a
+            separate box. If None or empty, plot a single overall distribution.
+
+        points : {'all', 'outliers', 'suspectedoutliers', False}, default 'all'
+            Passed to `plotly.express.box(..., points=...)` to control which points
+            are shown.
+
+        Returns
+        -------
+        go.Figure
+            The Plotly figure.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> from skfolio import Population, Portfolio, RatioMeasure, RiskMeasure
+        >>> rng = np.random.default_rng(0)
+        >>> # Daily returns for two assets.
+        >>> X = rng.normal(0.0005, [0.02, 0.01], size=(252, 2))
+        >>> population = Population(
+        ...     [
+        ...         Portfolio(X, weights=[0.6, 0.4], tag="Asset 1 tilt"),
+        ...         Portfolio(X, weights=[0.7, 0.3], tag="Asset 1 tilt"),
+        ...         Portfolio(X, weights=[0.8, 0.2], tag="Asset 1 tilt"),
+        ...         Portfolio(X, weights=[0.4, 0.6], tag="Asset 2 tilt"),
+        ...         Portfolio(X, weights=[0.3, 0.7], tag="Asset 2 tilt"),
+        ...         Portfolio(X, weights=[0.2, 0.8], tag="Asset 2 tilt"),
+        ...     ]
+        ... )
+
+        Plot all portfolios in one box:
+
+        >>> fig = population.boxplot_measure(measure=RiskMeasure.STANDARD_DEVIATION)
+
+        Plot one box per tag:
+
+        >>> fig = population.boxplot_measure(
+        ...     measure=RatioMeasure.SHARPE_RATIO,
+        ...     tag_list=["Asset 1 tilt", "Asset 2 tilt"],
+        ... )
+        """
+        if tag_list is None:
+            y = None
+            df = pd.DataFrame(self.measures(measure=measure), columns=["value"])
+        else:
+            y = "Population"
+            df = pd.concat(
+                [
+                    pd.DataFrame(
+                        {
+                            y: tag,
+                            "value": self.filter(tags=tag).measures(measure=measure),
+                        }
+                    )
+                    for tag in tag_list
+                ],
+                ignore_index=True,
+            )
+
+        fig = px.box(df, x="value", y=y, color=y, points=points)
+        fig.update_layout(title_text=f"Box plot of {measure}", xaxis_title=str(measure))
         return fig
 
     def plot_cumulative_returns(
         self,
         log_scale: bool = False,
-        idx: slice | np.ndarray | None = None,
-        names: skt.Names | None = None,
-        tags: skt.Tags | None = None,
+        idx: slice | IntArray | None = None,
+        use_tag_in_legend: bool = True,
     ) -> go.Figure:
-        """Plot the population's portfolios cumulative returns.
-        Non-compounded cumulative returns start at 0.
-        Compounded cumulative returns are rescaled to start at 1000.
+        """Plot the cumulative returns of the population's portfolios.
+        Non-compounded (arithmetic) cumulative returns start at 0.
+        Compounded (geometric) cumulative returns are expressed as a wealth index,
+        starting at 1.0 (i.e., the value of $1 invested).
 
         Parameters
         ----------
         log_scale : bool, default=False
-            If this is set to True, the cumulative returns are displayed with a
-            logarithm scale on the y-axis and rebased at 1000. The cumulative returns
-            must be compounded otherwise an exception is raise.
+            If set to True, the cumulative returns are displayed with a
+            logarithm scale on the y-axis. The cumulative returns must be compounded
+            otherwise an exception is raise.
 
         idx : slice | array, optional
             Indexes or slice of the observations to plot.
             The default (`None`) is to take all observations.
 
-        names : str | list[str], optional
-            If provided, the population is filtered by portfolio names.
-
-        tags : str | list[str], optional
-            If provided, the population is filtered by portfolio tags.
+        use_tag_in_legend : bool, default=True
+            Whether to include the portfolio tag in legend entries.
+            If True, each legend label will show the portfolio name followed by its tag;
+            if False, only the portfolio name will be displayed.
 
         Returns
         -------
@@ -573,29 +827,10 @@ class Population(list):
         """
         if idx is None:
             idx = slice(None)
-        portfolios = self.filter(names=names, tags=tags)
-        if not portfolios:
-            raise ValueError("No portfolio found")
 
-        cumulative_returns = []
-        names = []
-        compounded = []
-        for ptf in portfolios:
-            cumulative_returns.append(ptf.cumulative_returns_df)
-            names.append(f"{ptf.name}_{ptf.tag}" if ptf.tag is not None else ptf.name)
-            compounded.append(ptf.compounded)
-        compounded = set(compounded)
-
-        if len(compounded) == 2:
-            raise ValueError(
-                "Some portfolios cumulative returns are compounded while some "
-                "are non-compounded. You can change the compounded with"
-                "`population.set_portfolio_params(compounded=False)`",
-            )
+        compounded = self._validate_compounded()
         title = "Cumulative Returns"
-        compounded = compounded.pop()
         if compounded:
-            yaxis_title = f"{title} (rebased at 1000)"
             if log_scale:
                 title = f"{title} (compounded & log scaled)"
             else:
@@ -608,44 +843,112 @@ class Population(list):
                     "You can change to compounded with "
                     "`set_portfolio_params(compounded=True)`"
                 )
-            yaxis_title = title
             title = f"{title} (non-compounded)"
 
-        df = pd.concat(cumulative_returns, axis=1).iloc[:, idx]
-        # Sort index because pd.concat unsort NaNs at the end
-        df.sort_index(inplace=True)
-        df.columns = deduplicate_names(names)
-
-        fig = df.plot(backend="plotly")
+        df = self.cumulative_returns_df(use_tag_in_column_name=use_tag_in_legend)
+        fig = df.iloc[idx].plot(backend="plotly")
         fig.update_layout(
             title=title,
             xaxis_title="Observations",
-            yaxis_title=yaxis_title,
+            yaxis_title="Cumulative Returns",
             legend_title_text="Portfolios",
         )
         if compounded:
-            fig.update_yaxes(tickformat=".0f")
+            fig.update_yaxes(tickformat=".2f")
         else:
             fig.update_yaxes(tickformat=".2%")
         if log_scale:
             fig.update_yaxes(type="log")
         return fig
 
-    def plot_composition(
+    def plot_drawdowns(
         self,
-        names: skt.Names | None = None,
-        tags: skt.Tags | None = None,
-        display_sub_ptf_name: bool = True,
+        idx: slice | IntArray | None = None,
+        use_tag_in_legend: bool = True,
     ) -> go.Figure:
+        """Plot the drawdowns of the population's portfolios.
+
+        Parameters
+        ----------
+        idx : slice | array, optional
+            Indexes or slice of the observations to plot.
+            The default (`None`) is to take all observations.
+
+        use_tag_in_legend : bool, default=True
+            Whether to include the portfolio tag in legend entries.
+            If True, each legend label will show the portfolio name followed by its tag;
+            if False, only the portfolio name will be displayed.
+
+        Returns
+        -------
+        plot : Figure
+            Returns the plot Figure object.
+        """
+        if idx is None:
+            idx = slice(None)
+
+        compounded = self._validate_compounded()
+        title = "Drawdowns"
+        if compounded:
+            title = f"{title} (compounded returns)"
+        else:
+            title = f"{title} (non-compounded returns)"
+
+        df = self.drawdowns_df(use_tag_in_column_name=use_tag_in_legend)
+        fig = df.iloc[idx].plot(backend="plotly")
+        fig.update_layout(
+            title=title,
+            xaxis_title="Observations",
+            yaxis_title="Drawdowns",
+            legend_title_text="Portfolios",
+        )
+        fig.update_yaxes(tickformat=".1%")
+        return fig
+
+    def plot_composition(self, display_sub_ptf_name: bool = True) -> go.Figure:
         """Plot the compositions of the portfolios in the population.
 
         Parameters
         ----------
-        names : str | list[str], optional
-            If provided, the population is filtered by portfolio names.
+        display_sub_ptf_name : bool, default=True
+            If this is set to True, each sub-portfolio name composing a multi-period
+            portfolio is displayed.
 
-        tags : str | list[str], optional
-            If provided, the population is filtered by portfolio tags.
+        Returns
+        -------
+        plot : Figure
+            Returns the plotly Figure object.
+        """
+        df = self.composition(display_sub_ptf_name=display_sub_ptf_name).T
+        fig = px.bar(df, x=df.index, y=df.columns)
+        fig.update_layout(
+            title="Portfolios Composition",
+            xaxis_title="Portfolios",
+            yaxis={
+                "title": "Weight",
+                "tickformat": ",.0%",
+            },
+            legend=dict(yanchor="top", y=0.99, xanchor="left", x=1.15),
+        )
+        return fig
+
+    def plot_contribution(
+        self,
+        measure: skt.Measure,
+        spacing: float | None = None,
+        display_sub_ptf_name: bool = True,
+    ) -> go.Figure:
+        r"""Plot the contribution of each asset to a given measure of the portfolios
+        in the population.
+
+        Parameters
+        ----------
+        measure : Measure
+            The measure used for the contribution computation.
+
+        spacing : float, optional
+            Spacing "h" of the finite difference:
+            :math:`contribution(wi)= \frac{measure(wi-h) - measure(wi+h)}{2h}`
 
         display_sub_ptf_name : bool, default=True
             If this is set to True, each sub-portfolio name composing a multi-period
@@ -656,19 +959,22 @@ class Population(list):
         plot : Figure
             Returns the plotly Figure object.
         """
-        df = self.composition(
-            names=names, tags=tags, display_sub_ptf_name=display_sub_ptf_name
+        df = self.contribution(
+            display_sub_ptf_name=display_sub_ptf_name, measure=measure, spacing=spacing
         ).T
         fig = px.bar(df, x=df.index, y=df.columns)
+
+        yaxis = {
+            "title": "Contribution",
+        }
+        if not measure.is_ratio:
+            n = optimal_rounding_decimals(df.sum(axis=1).max())
+            yaxis["tickformat"] = f",.{n}%"
+
         fig.update_layout(
-            title="Portfolios Composition",
-            xaxis={
-                "title": "Portfolios",
-            },
-            yaxis={
-                "title": "Weight",
-                "tickformat": ",.0%",
-            },
+            title=f"{measure} Contribution",
+            xaxis_title="Portfolios",
+            yaxis=yaxis,
             legend=dict(yanchor="top", y=0.99, xanchor="left", x=1.15),
         )
         return fig
@@ -682,8 +988,6 @@ class Population(list):
         hover_measures: list[skt.Measure] | None = None,
         show_fronts: bool = False,
         color_scale: skt.Measure | str | None = None,
-        names: skt.Names | None = None,
-        tags: skt.Tags | None = None,
         title="Portfolios",
     ) -> go.Figure:
         """Plot the 2D (or 3D) scatter points (or surface) of a given set of
@@ -707,7 +1011,7 @@ class Population(list):
             The list of measure to show on point hover.
 
         show_fronts : bool, default=False
-            If this is set to True, the pareto fronts are highlighted.
+            If this is set to True, the Pareto fronts are highlighted.
             The default is `False`.
 
         color_scale : Measure | str, optional
@@ -716,18 +1020,11 @@ class Population(list):
         title : str, default="Portfolios"
             The graph title. The default value is "Portfolios".
 
-        names : str | list[str], optional
-            If provided, the population is filtered by portfolio names.
-
-        tags : str | list[str], optional
-            If provided, the population is filtered by portfolio tags.
-
         Returns
         -------
         plot : Figure
             Returns the plotly Figure object.
         """
-        portfolios = self.filter(names=names, tags=tags)
         num_fmt = ":.3f"
         hover_data = {x: num_fmt, y: num_fmt, "tag": True}
 
@@ -740,28 +1037,31 @@ class Population(list):
 
         columns = list(hover_data)
         columns.append("name")
-        if isinstance(color_scale, skt.Measure):
+        if isinstance(color_scale, BaseMeasure):
             hover_data[color_scale] = num_fmt
 
         if color_scale is not None and color_scale not in columns:
             columns.append(color_scale)
 
-        col_values = [e.value if isinstance(e, skt.Measure) else e for e in columns]
+        col_values = [e.value if isinstance(e, BaseMeasure) else e for e in columns]
         res = [
             [portfolio.__getattribute__(attr) for attr in col_values]
-            for portfolio in portfolios
+            for portfolio in self
         ]
         # Improved formatting
         columns = [str(e) for e in columns]
         hover_data = {str(k): v for k, v in hover_data.items()}
 
         df = pd.DataFrame(res, columns=columns)
-        df["tag"] = df["tag"].astype(str).replace("None", "")
+        if pd.isnull(df["tag"]).all():
+            del hover_data["tag"]
+            tag = None
+        else:
+            tag = "tag"
+            df["tag"] = df["tag"].astype(str).replace("None", "")
 
         if show_fronts:
-            fronts = self.non_denominated_sort(first_front_only=False)
-            if tags is not None:
-                ValueError("Cannot plot front with tags selected")
+            fronts = self.non_dominated_sort(first_front_only=False)
             df["front"] = str(-1)
             for i, front in enumerate(fronts):
                 for idx in front:
@@ -770,7 +1070,7 @@ class Population(list):
         elif color_scale is not None:
             color = str(color_scale)
         else:
-            color = "tag"
+            color = tag
 
         if z is not None:
             if to_surface:
@@ -804,8 +1104,7 @@ class Population(list):
                         )
                         + "<extra></extra>",
                         colorbar=dict(
-                            title=str(z),
-                            titleside="top",
+                            title=dict(text=str(z), side="top"),
                             tickformat=",.2%" if not z.is_ratio else None,
                         ),
                     )
@@ -838,7 +1137,7 @@ class Population(list):
                     hover_name="name",
                     hover_data=hover_data,
                     color=color,
-                    symbol="tag",
+                    symbol=tag,
                 )
                 fig.update_traces(marker_size=8)
                 fig.update_layout(
@@ -868,9 +1167,15 @@ class Population(list):
                 hover_name="name",
                 hover_data=hover_data,
                 color=color,
-                symbol="tag",
+                symbol=tag,
             )
             fig.update_traces(marker_size=10)
+
+            if color_scale is None:
+                legend = dict(title=None, yanchor="top", y=0.98, xanchor="left", x=1.02)
+            else:
+                legend = dict(title=None, yanchor="top", y=0.98, xanchor="left", x=0.02)
+
             fig.update_layout(
                 title=title,
                 xaxis={
@@ -881,6 +1186,110 @@ class Population(list):
                     "title": str(y),
                     "tickformat": ",.1%" if not y.is_ratio else None,
                 },
-                legend=dict(yanchor="top", y=0.96, xanchor="left", x=1.25),
+                legend=legend,
             )
         return fig
+
+    def plot_rolling_measure(
+        self,
+        measure: skt.Measure = RatioMeasure.SHARPE_RATIO,
+        window: int = 30,
+    ) -> go.Figure:
+        """Plot the measure over a rolling window for each portfolio in the population.
+
+        Parameters
+        ----------
+        measure : Measure, default = RatioMeasure.SHARPE_RATIO
+           The measure.
+
+        window : int, default=30
+           The window size.
+
+        Returns
+        -------
+        plot : Figure
+            Returns the plot Figure object
+        """
+        df = self.rolling_measure(measure=measure, window=window)
+        fig = df.plot(backend="plotly")
+        max_val = np.max(df)
+        min_val = np.min(df)
+        if max_val > 0 > min_val:
+            fig.add_hrect(
+                y0=0, y1=max_val * 1.3, line_width=0, fillcolor="green", opacity=0.1
+            )
+            fig.add_hrect(
+                y0=min_val * 1.3, y1=0, line_width=0, fillcolor="red", opacity=0.1
+            )
+
+        yaxis = {
+            "title": str(measure),
+        }
+        if not measure.is_ratio:
+            n = optimal_rounding_decimals(max_val)
+            yaxis["tickformat"] = f",.{n}%"
+
+        fig.update_layout(
+            title=f"Rolling {measure} - {window} observations window",
+            xaxis_title="Observations",
+            yaxis=yaxis,
+            showlegend=False,
+        )
+        return fig
+
+    def plot_returns_distribution(
+        self, percentile_cutoff: float | None = None
+    ) -> go.Figure:
+        """Plot the Portfolios returns distribution using Gaussian KDE.
+
+        Parameters
+        ----------
+        percentile_cutoff : float, default=None
+            Percentile cutoff for tail truncation (percentile), in percent.
+            If a float p is provided, the distribution support is truncated at the p-th
+            and (100 - p)-th percentiles.
+            If None, no truncation is applied (uses full min/max of returns).
+
+        Returns
+        -------
+        plot : Figure
+            Returns the plot Figure object
+        """
+        traces: list[go.Scatter] = []
+        colors = px.colors.qualitative.Plotly
+
+        for i, ptf in enumerate(self):
+            if isinstance(ptf, FailedPortfolio):
+                continue
+            color = colors[i % len(colors)]
+            returns = ptf.returns
+            traces.append(
+                kde_trace(
+                    x=returns,
+                    sample_weight=ptf.sample_weight,
+                    percentile_cutoff=percentile_cutoff,
+                    name=ptf.name,
+                    line_color=color,
+                    fill_opacity=0.3,
+                    line_dash="solid",
+                    line_width=1,
+                    visible=True,
+                )
+            )
+
+        fig = go.Figure(traces)
+        fig.update_layout(
+            title="Returns Distribution",
+            xaxis_title="Returns",
+            yaxis_title="Probability Density",
+        )
+        fig.update_xaxes(
+            tickformat=".0%",
+        )
+        return fig
+
+
+def _ptf_name_with_tag(portfolio: BasePortfolio) -> str:
+    if portfolio.tag is None:
+        return portfolio.name
+    return f"{portfolio.name}_{portfolio.tag}"

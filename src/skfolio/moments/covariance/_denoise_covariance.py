@@ -1,20 +1,23 @@
 """Covariance Denoising Estimators."""
 
-# Copyright (c) 2023
-# Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# Copyright (c) 2023-2026
+# Author: Hugo Delatte <hugo.delatte@skfoliolabs.com>
+# SPDX-License-Identifier: BSD-3-Clause
 # Implementation derived from:
 # scikit-learn, Copyright (c) 2007-2010 David Cournapeau, Fabian Pedregosa, Olivier
 # Grisel Licensed under BSD 3 clause.
 
+from __future__ import annotations
+
 import numpy as np
-import numpy.typing as npt
 import scipy.optimize as sco
 import sklearn.neighbors as skn
 import sklearn.utils.metadata_routing as skm
+import sklearn.utils.validation as skv
 
 from skfolio.moments.covariance._base import BaseCovariance
 from skfolio.moments.covariance._empirical_covariance import EmpiricalCovariance
+from skfolio.typing import ArrayLike
 from skfolio.utils.stats import corr_to_cov, cov_to_corr
 from skfolio.utils.tools import check_estimator
 
@@ -39,7 +42,7 @@ class DenoiseCovariance(BaseCovariance):
 
     nearest : bool, default=True
         If this is set to True, the covariance is replaced by the nearest covariance
-        matrix that is positive definite and with a Cholesky decomposition than can be
+        matrix that is positive definite and with a Cholesky decomposition that can be
         computed. The variance is left unchanged.
         A covariance matrix that is not positive definite often occurs in high
         dimensional problems. It can be due to multicollinearity, floating-point
@@ -103,7 +106,7 @@ class DenoiseCovariance(BaseCovariance):
         )
         return router
 
-    def fit(self, X: npt.ArrayLike, y=None, **fit_params) -> "DenoiseCovariance":
+    def fit(self, X: ArrayLike, y=None, **fit_params) -> DenoiseCovariance:
         """Fit the Covariance Denoising estimator.
 
         Parameters
@@ -117,7 +120,7 @@ class DenoiseCovariance(BaseCovariance):
         **fit_params : dict
             Parameters to pass to the underlying estimators.
             Only available if `enable_metadata_routing=True`, which can be
-            set by using ``sklearn.set_config(enable_metadata_routing=True)``.
+            set by using `sklearn.set_config(enable_metadata_routing=True)`.
             See :ref:`Metadata Routing User Guide <metadata_routing>` for
             more details.
 
@@ -139,7 +142,7 @@ class DenoiseCovariance(BaseCovariance):
 
         # we validate and convert to numpy after all models have been fitted to keep
         # features names information.
-        X = self._validate_data(X)
+        X = skv.validate_data(self, X)
         n_observations, n_assets = X.shape
         q = n_observations / n_assets
         corr, std = cov_to_corr(self.covariance_estimator_.covariance_)

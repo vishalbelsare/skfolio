@@ -1,14 +1,17 @@
 """Implied Covariance Estimators."""
 
-# Copyright (c) 2023
-# Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# Copyright (c) 2023-2026
+# Author: Hugo Delatte <hugo.delatte@skfoliolabs.com>
+# SPDX-License-Identifier: BSD-3-Clause
 # Implementation derived from:
 # scikit-learn, Copyright (c) 2007-2010 David Cournapeau, Fabian Pedregosa, Olivier
 # Grisel Licensed under BSD 3 clause.
 
+from __future__ import annotations
+
+import warnings
+
 import numpy as np
-import numpy.typing as npt
 import sklearn as sk
 import sklearn.base as skb
 import sklearn.linear_model as skl
@@ -17,8 +20,10 @@ import sklearn.utils.metadata_routing as skm
 import sklearn.utils.validation as skv
 
 import skfolio.typing as skt
+from skfolio._constants import _ANNUALIZATION_FACTOR_DEFAULT
 from skfolio.moments.covariance._base import BaseCovariance
 from skfolio.moments.covariance._empirical_covariance import EmpiricalCovariance
+from skfolio.typing import ArrayLike, FloatArray
 from skfolio.utils.stats import corr_to_cov, cov_to_corr
 from skfolio.utils.tools import (
     check_estimator,
@@ -67,8 +72,8 @@ class ImpliedCovariance(BaseCovariance):
         matrix used for the correlation estimates prior the volatilities update.
         The default (`None`) is to use :class:`~skfolio.moments.EmpiricalCovariance`.
 
-    annualized_factor : float, default=252
-        Annualized factor (AF) used to covert the implied volatilities into the same
+    annualization_factor : float, default=252
+        Annualization factor (AF) used to convert the implied volatilities into the same
         frequency as the returns using :math:`\frac{IV}{\sqrt{AF}}`.
         The default is 252 which corresponds to **daily** returns and implied volatility
         expressed in **p.a.**
@@ -98,7 +103,7 @@ class ImpliedCovariance(BaseCovariance):
 
     nearest : bool, default=True
         If this is set to True, the covariance is replaced by the nearest covariance
-        matrix that is positive definite and with a Cholesky decomposition than can be
+        matrix that is positive definite and with a Cholesky decomposition that can be
         computed. The variance is left unchanged.
         A covariance matrix that is not positive definite often occurs in high
         dimensional problems. It can be due to multicollinearity, floating-point
@@ -107,13 +112,13 @@ class ImpliedCovariance(BaseCovariance):
         The default is `True`.
 
     higham : bool, default=False
-        If this is set to True, the Higham & Nick (2002) algorithm is used to find the
+        If this is set to True, the Higham (2002) algorithm is used to find the
         nearest PD covariance, otherwise the eigenvalues are clipped to a threshold
-        above zeros (1e-13). The default is `False` and use the clipping method as the
-        Higham & Nick algorithm can be slow for large datasets.
+        above zeros (1e-13). The default is `False` and uses the clipping method as the
+        Higham algorithm can be slow for large datasets.
 
     higham_max_iteration : int, default=100
-        Maximum number of iteration of the Higham & Nick (2002) algorithm.
+        Maximum number of iterations of the Higham (2002) algorithm.
         The default value is `100`.
 
     Attributes
@@ -167,33 +172,52 @@ class ImpliedCovariance(BaseCovariance):
     """
 
     prior_covariance_estimator_: BaseCovariance
-    pred_realised_vols_: np.ndarray
+    pred_realised_vols_: FloatArray
     linear_regressors_: list
-    coefs_: np.ndarray
-    intercepts_: np.ndarray
-    r2_scores_: np.ndarray
+    coefs_: FloatArray
+    intercepts_: FloatArray
+    r2_scores_: FloatArray
 
     def __init__(
         self,
         prior_covariance_estimator: BaseCovariance | None = None,
-        annualized_factor: float = 252.0,
+        annualization_factor: float | None = None,
         window_size: int = 20,
         linear_regressor: skb.BaseEstimator | None = None,
         volatility_risk_premium_adj: skt.MultiInput | None = None,
         nearest: bool = True,
         higham: bool = False,
         higham_max_iteration: int = 100,
+        # TODO remove deprecated annualized_factor in v2.0
+        annualized_factor: float | None = None,
     ):
+        if annualized_factor is not None:
+            if annualization_factor is not None:
+                raise ValueError(
+                    "`annualized_factor` is deprecated; pass only "
+                    "`annualization_factor`."
+                )
+            warnings.warn(
+                "`annualized_factor` is deprecated and will be removed in version 2.0. "
+                "Use `annualization_factor` instead.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            annualization_factor = annualized_factor
+        elif annualization_factor is None:
+            annualization_factor = _ANNUALIZATION_FACTOR_DEFAULT
+
         super().__init__(
             nearest=nearest,
             higham=higham,
             higham_max_iteration=higham_max_iteration,
         )
         self.prior_covariance_estimator = prior_covariance_estimator
-        self.annualized_factor = annualized_factor
+        self.annualization_factor = annualization_factor
         self.linear_regressor = linear_regressor
         self.window_size = window_size
         self.volatility_risk_premium_adj = volatility_risk_premium_adj
+        self.annualized_factor = None
 
     def get_metadata_routing(self):
         # noinspection PyTypeChecker
@@ -207,9 +231,30 @@ class ImpliedCovariance(BaseCovariance):
         )
         return router
 
+    def set_params(self, **params) -> ImpliedCovariance:
+        """Set estimator parameters."""
+        # TODO remove deprecated annualized_factor in v2.0
+        if "annualized_factor" in params:
+            annualized_factor = params.pop("annualized_factor")
+            if annualized_factor is not None:
+                if "annualization_factor" in params:
+                    raise ValueError(
+                        "`annualized_factor` is deprecated; pass only "
+                        "`annualization_factor`."
+                    )
+                warnings.warn(
+                    "`annualized_factor` is deprecated and will be removed in version 2.0. "
+                    "Use `annualization_factor` instead.",
+                    FutureWarning,
+                    stacklevel=2,
+                )
+                params["annualization_factor"] = annualized_factor
+            params["annualized_factor"] = None
+        return super().set_params(**params)
+
     def fit(
-        self, X: npt.ArrayLike, y=None, implied_vol: npt.ArrayLike = None, **fit_params
-    ) -> "ImpliedCovariance":
+        self, X: ArrayLike, y=None, implied_vol: ArrayLike = None, **fit_params
+    ) -> ImpliedCovariance:
         """Fit the implied covariance estimator.
 
         Parameters
@@ -226,7 +271,7 @@ class ImpliedCovariance(BaseCovariance):
         **fit_params : dict
             Parameters to pass to the underlying estimators.
             Only available if `enable_metadata_routing=True`, which can be
-            set by using ``sklearn.set_config(enable_metadata_routing=True)``.
+            set by using `sklearn.set_config(enable_metadata_routing=True)`.
             See :ref:`Metadata Routing User Guide <metadata_routing>` for
             more details.
 
@@ -259,7 +304,7 @@ class ImpliedCovariance(BaseCovariance):
         if assets_names is not None:
             vol_assets_names = get_feature_names(implied_vol)
             if vol_assets_names is not None:
-                missing_assets = assets_names[~np.in1d(assets_names, vol_assets_names)]
+                missing_assets = assets_names[~np.isin(assets_names, vol_assets_names)]
                 if len(missing_assets) > 0:
                     raise ValueError(
                         f"The following assets are missing from "
@@ -272,10 +317,10 @@ class ImpliedCovariance(BaseCovariance):
                 # and re-order to follow returns ordering.
                 implied_vol = safe_indexing(implied_vol, indices=indices, axis=1)
 
-        X = self._validate_data(X)
+        X = skv.validate_data(self, X)
         _, n_assets = X.shape
         implied_vol = check_implied_vol(implied_vol=implied_vol, X=X)
-        implied_vol /= np.sqrt(self.annualized_factor)
+        implied_vol /= np.sqrt(self.annualization_factor)
 
         if self.volatility_risk_premium_adj is not None:
             if np.isscalar(self.volatility_risk_premium_adj):
@@ -286,11 +331,7 @@ class ImpliedCovariance(BaseCovariance):
                     n_assets=n_assets,
                     fill_value=np.nan,
                     dim=1,
-                    assets_names=(
-                        self.feature_names_in_
-                        if hasattr(self, "feature_names_in_")
-                        else None
-                    ),
+                    assets_names=getattr(self, "feature_names_in_", None),
                     name="volatility_risk_premium_adj",
                 )
 
@@ -333,8 +374,8 @@ class ImpliedCovariance(BaseCovariance):
     def _predict_realised_vols(
         self,
         linear_regressor: skb.BaseEstimator,
-        returns: np.ndarray,
-        implied_vol: np.ndarray,
+        returns: FloatArray,
+        implied_vol: FloatArray,
         window_size: int,
     ) -> None:
         n_observations, n_assets = returns.shape
@@ -356,9 +397,6 @@ class ImpliedCovariance(BaseCovariance):
         implied_vol = _compute_implied_vol(
             implied_vol=implied_vol, window_size=window_size
         )
-
-        if realised_vol.shape != implied_vol.shape:
-            raise ValueError("`realised_vol`and `implied_vol` must have same shape")
 
         assert realised_vol.shape[0] == n_folds
 
@@ -387,8 +425,8 @@ class ImpliedCovariance(BaseCovariance):
 
 
 def _compute_realised_vol(
-    returns: np.ndarray, window_size: int, ddof: int = 1
-) -> np.ndarray:
+    returns: FloatArray, window_size: int, ddof: int = 1
+) -> FloatArray:
     """Create the realised volatilities samples for the regression model."""
     n_observations, n_assets = returns.shape
     chunks = n_observations // window_size
@@ -403,7 +441,7 @@ def _compute_realised_vol(
     )
 
 
-def _compute_implied_vol(implied_vol: np.ndarray, window_size: int) -> np.ndarray:
+def _compute_implied_vol(implied_vol: FloatArray, window_size: int) -> FloatArray:
     """Create the implied volatilities samples for the regression model."""
     n_observations, _ = implied_vol.shape
     chunks = n_observations // window_size
@@ -414,9 +452,8 @@ def _compute_implied_vol(implied_vol: np.ndarray, window_size: int) -> np.ndarra
     ]
 
 
-def check_implied_vol(implied_vol: npt.ArrayLike, X: npt.ArrayLike) -> np.ndarray:
+def check_implied_vol(implied_vol: ArrayLike, X: ArrayLike) -> FloatArray:
     """Validate implied volatilities.
-
 
     Parameters
     ----------

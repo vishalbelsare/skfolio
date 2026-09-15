@@ -1,17 +1,21 @@
 """Gerber Covariance Estimators."""
 
-# Copyright (c) 2023
-# Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# Copyright (c) 2023-2026
+# Author: Hugo Delatte <hugo.delatte@skfoliolabs.com>
+# SPDX-License-Identifier: BSD-3-Clause
 # Implementation derived from:
 # scikit-learn, Copyright (c) 2007-2010 David Cournapeau, Fabian Pedregosa, Olivier
 # Grisel Licensed under BSD 3 clause.
 
+from __future__ import annotations
+
 import numpy as np
-import numpy.typing as npt
+import sklearn.utils.validation as skv
 
 from skfolio.moments.covariance._base import BaseCovariance
+from skfolio.typing import ArrayLike
 from skfolio.utils.stats import corr_to_cov
+from skfolio.utils.tools import apply_window_size
 
 
 class GerberCovariance(BaseCovariance):
@@ -48,7 +52,7 @@ class GerberCovariance(BaseCovariance):
 
     nearest : bool, default=True
         If this is set to True, the covariance is replaced by the nearest covariance
-        matrix that is positive definite and with a Cholesky decomposition than can be
+        matrix that is positive definite and with a Cholesky decomposition that can be
         computed. The variance is left unchanged.
         A covariance matrix that is not positive definite often occurs in high
         dimensional problems. It can be due to multicollinearity, floating-point
@@ -57,13 +61,13 @@ class GerberCovariance(BaseCovariance):
         The default is `True`.
 
     higham : bool, default=False
-        If this is set to True, the Higham & Nick (2002) algorithm is used to find the
+        If this is set to True, the Higham (2002) algorithm is used to find the
         nearest PD covariance, otherwise the eigenvalues are clipped to a threshold
-        above zeros (1e-13). The default is `False` and use the clipping method as the
-        Higham & Nick algorithm can be slow for large datasets.
+        above zeros (1e-13). The default is `False` and uses the clipping method as the
+        Higham algorithm can be slow for large datasets.
 
     higham_max_iteration : int, default=100
-        Maximum number of iteration of the Higham & Nick (2002) algorithm.
+        Maximum number of iterations of the Higham (2002) algorithm.
         The default value is `100`.
 
     Attributes
@@ -115,7 +119,7 @@ class GerberCovariance(BaseCovariance):
         self.threshold = threshold
         self.psd_variant = psd_variant
 
-    def fit(self, X: npt.ArrayLike, y=None) -> "GerberCovariance":
+    def fit(self, X: ArrayLike, y=None) -> GerberCovariance:
         """Fit the Gerber covariance estimator.
 
         Parameters
@@ -131,9 +135,8 @@ class GerberCovariance(BaseCovariance):
         self : GerberCovariance
            Fitted estimator.
         """
-        X = self._validate_data(X)
-        if self.window_size is not None:
-            X = X[-self.window_size :]
+        X = skv.validate_data(self, X)
+        X = apply_window_size(X=X, window_size=self.window_size)
         if not (1 > self.threshold > 0):
             raise ValueError("The threshold must be between 0 and 1")
         n_observations = X.shape[0]

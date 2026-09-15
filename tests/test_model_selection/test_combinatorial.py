@@ -1,10 +1,26 @@
+"""Test Combinatorial module."""
+
+from __future__ import annotations
+
 import math
 
 import numpy as np
 import pytest
+from sklearn.pipeline import Pipeline
 
-from skfolio.model_selection import CombinatorialPurgedCV, optimal_folds_number
-from skfolio.model_selection._combinatorial import _avg_train_size, _n_test_paths
+from skfolio import Population
+from skfolio.model_selection import (
+    CombinatorialPurgedCV,
+    cross_val_predict,
+    optimal_folds_number,
+)
+from skfolio.model_selection._combinatorial import (
+    _MAX_COMBINATIONS,
+    _avg_train_size,
+    _n_test_paths,
+)
+from skfolio.optimization import InverseVolatility
+from skfolio.pre_selection import SelectKExtremes
 
 
 def assert_split_equal(split, res):
@@ -175,7 +191,54 @@ def test_combinatorial_purged_cv():
     )
 
 
-def optimal_folds_number_full_search(
+class TestCombinatorialPurgedCVMaxCombinations:
+    """Tests for the _MAX_COMBINATIONS guard in CombinatorialPurgedCV."""
+
+    def test_exceeds_max_combinations(self):
+        """n_folds=20, n_test_folds=10 produces C(20,10)=184,756 splits which
+        exceeds _MAX_COMBINATIONS and should raise."""
+        with pytest.raises(ValueError, match="exceeds the maximum allowed"):
+            CombinatorialPurgedCV(n_folds=20, n_test_folds=10)
+
+    def test_error_message_contains_split_count(self):
+        n_folds, n_test_folds = 20, 10
+        n_combinations = math.comb(n_folds, n_test_folds)
+        with pytest.raises(ValueError, match=f"{n_combinations:,}"):
+            CombinatorialPurgedCV(n_folds=n_folds, n_test_folds=n_test_folds)
+
+    def test_error_message_contains_max(self):
+        with pytest.raises(ValueError, match=f"{_MAX_COMBINATIONS:,}"):
+            CombinatorialPurgedCV(n_folds=20, n_test_folds=10)
+
+    def test_error_message_mentions_misconfiguration(self):
+        with pytest.raises(ValueError, match="misconfiguration"):
+            CombinatorialPurgedCV(n_folds=20, n_test_folds=10)
+
+    def test_below_max_combinations_ok(self):
+        """n_folds=15, n_test_folds=2 produces C(15,2)=105 splits, well within
+        the limit."""
+        cv = CombinatorialPurgedCV(n_folds=15, n_test_folds=2)
+        assert cv.n_splits == math.comb(15, 2)
+
+    def test_just_below_max_combinations_ok(self):
+        """Find a combination just under the limit and verify it is accepted."""
+        # C(18, 9) = 48,620 — well within 100,000
+        cv = CombinatorialPurgedCV(n_folds=18, n_test_folds=9)
+        assert cv.n_splits == math.comb(18, 9)
+
+    def test_symmetric_both_sides(self):
+        """C(n, k) == C(n, n-k), so n_test_folds near 1 should be fine even
+        for large n_folds, while n_test_folds near n_folds/2 blows up."""
+        # C(50, 2) = 1,225 — fine
+        cv = CombinatorialPurgedCV(n_folds=50, n_test_folds=2)
+        assert cv.n_splits == 1225
+
+        # C(50, 25) is astronomically large — should raise
+        with pytest.raises(ValueError, match="exceeds the maximum allowed"):
+            CombinatorialPurgedCV(n_folds=50, n_test_folds=25)
+
+
+def _optimal_folds_number_full_search(
     n_observations: int,
     target_train_size: int,
     target_n_test_paths: int,
@@ -226,12 +289,18 @@ def test_optimal_folds_number(
         target_n_test_paths=target_n_test_paths,
     )
     assert res == expected
+    if n_observations <= 100:
+        assert res == _optimal_folds_number_full_search(
+            n_observations=n_observations,
+            target_train_size=target_train_size,
+            target_n_test_paths=target_n_test_paths,
+        )
 
 
 def test_optimal_folds_number_weight():
-    n_observations = 5000
-    target_train_size = 250
-    target_n_test_paths = 50
+    n_observations = 500
+    target_train_size = 50
+    target_n_test_paths = 20
 
     n_folds, n_test_folds = optimal_folds_number(
         n_observations=n_observations,
@@ -239,12 +308,12 @@ def test_optimal_folds_number_weight():
         target_n_test_paths=target_n_test_paths,
     )
     avg_train_size = n_observations / n_folds * (n_folds - n_test_folds)
-    n_test_paths = int(math.comb(n_folds, n_test_folds)) * n_test_folds // n_folds
+    n_test_paths = math.comb(n_folds, n_test_folds) * n_test_folds // n_folds
 
-    assert n_folds == 51
-    assert n_test_folds == 50
-    assert int(avg_train_size) == 98
-    assert n_test_paths == 50
+    assert n_folds == 21
+    assert n_test_folds == 20
+    assert int(avg_train_size) == 23
+    assert n_test_paths == 20
 
     n_folds, n_test_folds = optimal_folds_number(
         n_observations=n_observations,
@@ -253,9 +322,125 @@ def test_optimal_folds_number_weight():
         weight_train_size=2,
     )
     avg_train_size = n_observations / n_folds * (n_folds - n_test_folds)
-    n_test_paths = int(math.comb(n_folds, n_test_folds)) * n_test_folds // n_folds
+    n_test_paths = math.comb(n_folds, n_test_folds) * n_test_folds // n_folds
 
-    assert n_folds == 20
-    assert n_test_folds == 19
-    assert int(avg_train_size) == 250
-    assert n_test_paths == 19
+    assert n_folds == 10
+    assert n_test_folds == 9
+    assert int(avg_train_size) == 50
+    assert n_test_paths == 9
+
+
+def test_cross_val_predict_and_grid_search(X):
+    cv = CombinatorialPurgedCV(n_folds=3, n_test_folds=2, purged_size=1, embargo_size=2)
+
+    model = Pipeline(
+        [("pre_selection", SelectKExtremes(k=10)), ("allocation", InverseVolatility())]
+    )
+
+    pred = cross_val_predict(model, X, cv=cv)
+    assert isinstance(pred, Population)
+    assert len(pred) == cv.n_test_paths
+
+
+def test_combinatorial_purged_cv_split_returns_lists():
+    """Test that split() yields lists of test indices for multi-path backtesting."""
+    X = np.random.randn(12, 2)
+    cv = CombinatorialPurgedCV(n_folds=3, n_test_folds=2, purged_size=0, embargo_size=0)
+
+    splits = list(cv.split(X))
+
+    # Should have 3 splits
+    assert len(splits) == 3
+
+    for train, test in splits:
+        # test should be a list for multi-path backtesting
+        assert isinstance(test, list)
+        assert len(test) == 2  # 2 test folds
+
+        # Each test element should be an array
+        for test_array in test:
+            assert isinstance(test_array, np.ndarray)
+
+        # train should be an array
+        assert isinstance(train, np.ndarray)
+
+        # test arrays and train should be non-overlapping
+        test_concat = np.concatenate(test)
+        assert len(np.intersect1d(train, test_concat)) == 0
+
+
+def test_combinatorial_purged_cv_get_n_splits():
+    """Test that get_n_splits returns correct number of splits."""
+    cv = CombinatorialPurgedCV(n_folds=3, n_test_folds=2, purged_size=0, embargo_size=0)
+
+    assert cv.get_n_splits() == cv.n_splits
+    assert cv.get_n_splits() == 3
+    # scikit-learn compatible signature: X, y, groups are accepted but ignored
+    assert cv.get_n_splits(X=None, y=None, groups=None) == 3
+
+
+def test_cross_val_predict_concatenated_indices(X):
+    """Test that cross_val_predict correctly handles multi-path test indices."""
+    cv = CombinatorialPurgedCV(n_folds=3, n_test_folds=2, purged_size=1, embargo_size=2)
+
+    model = Pipeline(
+        [("pre_selection", SelectKExtremes(k=10)), ("allocation", InverseVolatility())]
+    )
+
+    # cross_val_predict should handle list test indices gracefully
+    pred = cross_val_predict(model, X, cv=cv)
+
+    # Result should be a Population with correct number of paths
+    assert isinstance(pred, Population)
+    assert len(pred) == cv.n_test_paths
+
+    # Each path should be a MultiPeriodPortfolio
+    for portfolio in pred:
+        assert hasattr(portfolio, "name")
+        # Each portfolio should have correct number of folds
+        assert len(portfolio.portfolios) == cv.n_folds
+
+
+def test_combinatorial_purged_cv_regression():
+    """Regression test: ensure CombinatorialPurgedCV returns lists for multi-path."""
+    X = np.random.randn(20, 5)
+    cv = CombinatorialPurgedCV(n_folds=4, n_test_folds=2, purged_size=0, embargo_size=0)
+
+    for _, test in cv.split(X):
+        # test should be a list for multi-path backtesting
+        assert isinstance(test, list), (
+            "split() should yield lists for multi-path backtesting"
+        )
+        assert len(test) == cv.n_test_folds
+        # Should contain valid indices
+        for test_array in test:
+            assert np.all((test_array >= 0) & (test_array < len(X)))
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"n_folds": 3.5}, "The number of folds must be of Integral type"),
+        ({"n_folds": 2, "n_test_folds": 2}, "`n_folds` must be at least 3"),
+        ({"n_folds": 3, "n_test_folds": 1}, "`n_test_folds` must at least 2"),
+        (
+            {"n_folds": 3, "n_test_folds": 3},
+            "requires `n_folds` to be greater than `n_test_folds`",
+        ),
+        ({"n_folds": 3, "n_test_folds": 2, "purged_size": -1}, "`purged_size`"),
+        ({"n_folds": 3, "n_test_folds": 2, "embargo_size": -1}, "`embargo_size`"),
+    ],
+)
+def test_combinatorial_purged_cv_invalid_init(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        CombinatorialPurgedCV(**kwargs)
+
+
+def test_combinatorial_purged_cv_split_rejects_too_large_purge_and_embargo():
+    X = np.zeros((12, 2))
+    cv = CombinatorialPurgedCV(n_folds=3, n_test_folds=2, purged_size=2, embargo_size=1)
+    with pytest.raises(
+        ValueError,
+        match="sum of `purged_size` and `embargo_size` must be smaller than the size",
+    ):
+        list(cv.split(X))

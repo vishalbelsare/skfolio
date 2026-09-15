@@ -12,18 +12,26 @@ from skfolio.moments.covariance._graphical_lasso_cv import GraphicalLassoCV
 from skfolio.moments.covariance._implied_covariance import ImpliedCovariance
 from skfolio.moments.covariance._ledoit_wolf import LedoitWolf
 from skfolio.moments.covariance._oas import OAS
+from skfolio.moments.covariance._regime_adjusted_ew_covariance import (
+    RegimeAdjustedEWCovariance,
+    RegimeAdjustmentMethod,
+    RegimeAdjustmentTarget,
+)
 from skfolio.moments.covariance._shrunk_covariance import ShrunkCovariance
 
 __all__ = [
+    "OAS",
     "BaseCovariance",
-    "EmpiricalCovariance",
-    "EWCovariance",
-    "GerberCovariance",
     "DenoiseCovariance",
     "DetoneCovariance",
-    "LedoitWolf",
-    "OAS",
-    "ShrunkCovariance",
+    "EWCovariance",
+    "EmpiricalCovariance",
+    "GerberCovariance",
     "GraphicalLassoCV",
     "ImpliedCovariance",
+    "LedoitWolf",
+    "RegimeAdjustedEWCovariance",
+    "RegimeAdjustmentMethod",
+    "RegimeAdjustmentTarget",
+    "ShrunkCovariance",
 ]

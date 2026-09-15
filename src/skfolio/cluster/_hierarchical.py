@@ -1,13 +1,14 @@
 """Hierarchical Clustering estimators."""
 
-# Copyright (c) 2023
-# Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# Copyright (c) 2023-2026
+# Author: Hugo Delatte <hugo.delatte@skfoliolabs.com>
+# SPDX-License-Identifier: BSD-3-Clause
+
+from __future__ import annotations
 
 from enum import auto
 
 import numpy as np
-import numpy.typing as npt
 import plotly.graph_objects as go
 import scipy.cluster.hierarchy as sch
 import scipy.spatial.distance as scd
@@ -15,6 +16,7 @@ import sklearn.base as skb
 import sklearn.utils.validation as skv
 from plotly.figure_factory import create_dendrogram
 
+from skfolio.typing import ArrayLike, FloatArray
 from skfolio.utils.stats import assert_is_distance, compute_optimal_n_clusters
 from skfolio.utils.tools import AutoEnum, default_asset_names
 
@@ -41,7 +43,7 @@ class LinkageMethod(AutoEnum):
         .. math:: d(u, v) = \max(dist(u[i],v[j]))
 
         for all points :math:`i` in cluster u and :math:`j` in
-        cluster :math:`v`. This is also known by the Farthest Point
+        cluster :math:`v`. This is also known as the Farthest Point
         Algorithm or Voor Hees Algorithm.
 
     AVERAGE : str
@@ -74,7 +76,7 @@ class LinkageMethod(AutoEnum):
         algorithm.
 
     MEDIAN : str
-    assigns :math:`d(s,t)` like the ``centroid`` method.
+    assigns :math:`d(s,t)` like the `centroid` method.
     This is also known as the WPGMC algorithm.
 
     WARD : str
@@ -112,9 +114,9 @@ class HierarchicalClustering(skb.ClusterMixin, skb.BaseEstimator):
     Parameters
     ----------
     max_clusters : int, optional
-        For coherent clustering, the algorithm finds a minimum threshold ``r`` so that
+        For coherent clustering, the algorithm finds a minimum threshold `r` so that
         the cophenetic distance between any two original observations in the same flat
-        cluster is no more than ``r`` and no more than `max_clusters` flat clusters are
+        cluster is no more than `r` and no more than `max_clusters` flat clusters are
         formed. The default (`None`) is to estimate the maximal number of clusters
         based on the Two-Order Difference to Gap Statistic [1]_.
 
@@ -152,9 +154,9 @@ class HierarchicalClustering(skb.ClusterMixin, skb.BaseEstimator):
     """
 
     n_clusters_: int
-    labels_: np.ndarray
-    linkage_matrix_: np.ndarray
-    condensed_distance_: np.ndarray
+    labels_: FloatArray
+    linkage_matrix_: FloatArray
+    condensed_distance_: FloatArray
 
     def __init__(
         self,
@@ -164,7 +166,7 @@ class HierarchicalClustering(skb.ClusterMixin, skb.BaseEstimator):
         self.max_clusters = max_clusters
         self.linkage_method = linkage_method
 
-    def fit(self, X: npt.ArrayLike, y: None = None) -> "HierarchicalClustering":
+    def fit(self, X: ArrayLike, y: None = None) -> HierarchicalClustering:
         """Fit the Hierarchical Equal Risk Contribution estimator.
 
         Parameters
@@ -180,7 +182,7 @@ class HierarchicalClustering(skb.ClusterMixin, skb.BaseEstimator):
         self : HierarchicalClustering
             Fitted estimator.
         """
-        X = self._validate_data(X)
+        X = skv.validate_data(self, X)
         assert_is_distance(X)
         self.condensed_distance_ = scd.squareform(X, checks=False)
         self.linkage_matrix_ = sch.linkage(

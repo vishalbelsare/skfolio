@@ -12,6 +12,13 @@ the assets returns and stores the portfolio weights in its `weights_` attribute.
 
 `X` can be any array-like structure (numpy array, pandas DataFrame, etc.)
 
+All optimization inputs (expected returns, covariance, return scenarios) are expressed
+in the periodicity of `X`: with daily returns, the optimizer works with daily moments
+and scenarios rather than annualized ones. Parameters that share the unit of expected
+returns, such as `transaction_costs` and `management_fees`, must be expressed in the
+same periodicity. See :ref:`Periodicity Convention <periodicity_convention>` for the
+rationale and the cost conversion rules.
+
 Naive Allocation
 ****************
 
@@ -120,7 +127,7 @@ It supports the following parameters:
 
     * Weight Constraints
     * Budget Constraints
-    * Group Constrains
+    * Group Constraints
     * Transaction Costs
     * Management Fees
     * L1 and L2 Regularization
@@ -166,16 +173,21 @@ Prior Estimator
 ===============
 
 Every portfolio optimization has a parameter named `prior_estimator`.
-The :ref:`prior estimator <prior>` fits a :class:`~skfolio.prior.PriorModel` containing
-the estimation of assets     expected returns, covariance matrix, returns and Cholesky
+The :ref:`prior estimator <prior>` fits a :class:`~skfolio.prior.ReturnDistribution` containing
+estimates of expected asset returns, covariance matrix, returns and Cholesky
 decomposition of the covariance. It represents the investor’s prior beliefs about the
 model used to estimate such distribution.
+
+When the prior follows the native NaN-aware convention, compatible optimizers solve the
+optimization problem on the investable subset and expand `weights_` back to the full
+input universe. See :ref:`Missing Data and Changing Universes <missing_data>` for
+details.
 
 The available prior estimators are:
 
     * :class:`~skfolio.prior.EmpiricalPrior`
     * :class:`~skfolio.prior.BlackLitterman`
-    * :class:`~skfolio.prior.FactorModel`
+    * :class:`~skfolio.prior.TimeSeriesFactorModel`
 
 **Example:**
 
@@ -188,16 +200,16 @@ Minimum Variance portfolio using a Factor Model:
     from skfolio.datasets import load_factors_dataset, load_sp500_dataset
     from skfolio.optimization import MeanRisk
     from skfolio.preprocessing import prices_to_returns
-    from skfolio.prior import FactorModel
+    from skfolio.prior import TimeSeriesFactorModel
 
     prices = load_sp500_dataset()
     factor_prices = load_factors_dataset()
 
-    X, y = prices_to_returns(prices, factor_prices)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.33, shuffle=False)
+    X, factors = prices_to_returns(prices, factor_prices)
+    X_train, X_test, factors_train, factors_test = train_test_split(X, factors, test_size=0.33, shuffle=False)
 
-    model = MeanRisk(prior_estimator=FactorModel())
-    model.fit(X_train, y_train)
+    model = MeanRisk(prior_estimator=TimeSeriesFactorModel())
+    model.fit(X_train, factors=factors_train)
     print(model.weights_)
 
     portfolio = model.predict(X_test)
@@ -216,9 +228,9 @@ This example is **purposely complex** to demonstrate how multiple estimators can
 combined.
 
 The model below is a Maximum Sharpe Ratio optimization using a Factor Model for the
-estimation of the **assets** expected reruns and covariance matrix. A Black & Litterman
-model is used for the estimation of the **factors** expected reruns and covariance matrix,
-incorporating the analyst' views on the factors. Finally, the Black & Litterman prior
+estimation of the **assets** expected returns and covariance matrix. A Black & Litterman
+model is used for the estimation of the **factors** expected returns and covariance matrix,
+incorporating the analysts' views on the factors. Finally, the Black & Litterman prior
 expected returns are estimated using an equal-weighted market equilibrium with a risk
 aversion of 2 and a denoised prior covariance matrix:
 
@@ -230,13 +242,13 @@ aversion of 2 and a denoised prior covariance matrix:
     from skfolio.moments import DenoiseCovariance, EquilibriumMu
     from skfolio.optimization import MeanRisk, ObjectiveFunction
     from skfolio.preprocessing import prices_to_returns
-    from skfolio.prior import BlackLitterman, EmpiricalPrior, FactorModel
+    from skfolio.prior import BlackLitterman, EmpiricalPrior, TimeSeriesFactorModel
 
     prices = load_sp500_dataset()
     factor_prices = load_factors_dataset()
 
-    X, y = prices_to_returns(prices, factor_prices)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.33, shuffle=False)
+    X, factors = prices_to_returns(prices, factor_prices)
+    X_train, X_test, factors_train, factors_test = train_test_split(X, factors, test_size=0.33, shuffle=False)
 
     factor_views = ["MTUM - QUAL == 0.0003 ",
                     "SIZE - USMV == 0.0004",
@@ -244,7 +256,7 @@ aversion of 2 and a denoised prior covariance matrix:
 
     model = MeanRisk(
         objective_function=ObjectiveFunction.MAXIMIZE_RATIO,
-        prior_estimator=FactorModel(
+        prior_estimator=TimeSeriesFactorModel(
             factor_prior_estimator=BlackLitterman(
                 prior_estimator=EmpiricalPrior(
                     mu_estimator=EquilibriumMu(risk_aversion=2),
@@ -254,7 +266,7 @@ aversion of 2 and a denoised prior covariance matrix:
         )
     )
 
-    model.fit(X_train, y_train)
+    model.fit(X_train, factors=factors_train)
     print(model.weights_)
 
     portfolio = model.predict(X_test)
@@ -308,9 +320,10 @@ For more complex cases and estimators, check the :ref:`API Reference <api>`.
 Worst-Case Optimization
 =======================
 With the `mu_uncertainty_set_estimator` parameter, the expected returns of the assets
-are modeled with an ellipsoidal uncertainty set. This approach is known as worst-case
-optimization and falls under the class of robust optimization. It mitigates the
-instability that arises from estimation errors of the expected returns.
+are modeled with a :ref:`norm-ball uncertainty set <uncertainty_set_estimator>`. This
+approach is known as worst-case optimization and falls under the class of robust
+optimization. It mitigates the instability that arises from estimation errors of the
+expected returns.
 
 **Example:**
 
@@ -343,6 +356,12 @@ uncertainty set for the expected returns of the assets:
     portfolio = model.predict(X_test)
     print(portfolio.annualized_sharpe_ratio)
     print(portfolio.cdar_ratio)
+
+Covariance uncertainty is configured with `covariance_uncertainty_set_estimator`.
+It is applied to the variance risk measure or a `max_variance` constraint. Generic
+estimators use a lifted semidefinite formulation, while
+:class:`~skfolio.uncertainty_set.OrthogonalCovarianceUncertaintySet` uses a compact
+representation in the factor model's orthogonal space.
 
 
 Going Further
@@ -509,7 +528,8 @@ by Marcos Lopez de Prado.
 
 This algorithm uses a distance matrix to compute hierarchical clusters using the
 Hierarchical Tree Clustering algorithm then employs seriation to rearrange the assets
-in the dendrogram, minimizing the distance between leafs.
+in the dendrogram, minimizing the distance between leaves.
+in the dendrogram, minimizing the distance between leaves.
 
 The final step is the recursive bisection where each cluster is split between two
 sub-clusters by starting with the topmost cluster and traversing in a top-down
@@ -599,7 +619,7 @@ during the top-down recursive division instead of bisecting it.
 It supports all :ref:`prior estimators <prior>` and :ref:`risk measures <measures_ref>`
 as well as weight constraints.
 
-It also supports all :ref:`distance estimator <distance>` through the
+It also supports all :ref:`distance estimators <distance>` through the
 `distance_estimator` parameter. It fits a distance model for the
 estimation of the codependence and the distance matrix used to compute the linkage
 matrix:
@@ -650,7 +670,7 @@ The :class:`NestedClustersOptimization` (NCO) is a portfolio optimization method
 developed by Marcos Lopez de Prado.
 
 It uses a distance matrix to compute clusters using a clustering algorithm (
-Hierarchical Tree Clustering, KMeans, etc..). For each cluster, the inner-cluster
+Hierarchical Tree Clustering, KMeans, etc.). For each cluster, the inner-cluster
 weights are computed by fitting the inner-estimator on each cluster using the whole
 training data. Then the outer-cluster weights are computed by training the
 outer-estimator using out-of-sample estimates of the inner-estimators with
@@ -667,7 +687,7 @@ inner-weights and outer-weights.
     To avoid data leakage at the outer-estimator, we use out-of-sample estimates to
     fit the outer estimator.
 
-It supports all :ref:`distance estimator <distance>`
+It supports all :ref:`distance estimators <distance>`
 and :ref:`clustering estimator <cluster>` (both `skfolio` and `sklearn`)
 
 **Example:**
@@ -675,7 +695,7 @@ and :ref:`clustering estimator <cluster>` (both `skfolio` and `sklearn`)
 Nested Clusters Optimization with KMeans as the clustering algorithm, Kendall Distance
 as the distance estimator, Minimum Semi-Variance as the inner estimator, and CVaR Risk
 Parity as the outer (meta) estimator trained on the out-of-sample estimates from the
-KFolds cross-validation and run with parallelization:
+KFold cross-validation and run with parallelization:
 
 .. code-block:: python
 
@@ -718,14 +738,14 @@ the `quantile` and `quantile_measure` parameters.
 Stacking Optimization
 *********************
 
-:class:`StackingOptimization` is an ensemble method that consists in stacking the output
+:class:`StackingOptimization` is an ensemble method that consists of stacking the outputs
 of individual portfolio optimizations with a final portfolio optimization.
 
-The weights are the dot-product of individual optimizations weights with the final
-optimization weights.
+The final weights are the dot product of the individual optimizations' weights and the final
+optimization's weights.
 
-Stacking allows to use the strength of each individual portfolio optimization by
-using their output as input of a final portfolio optimization.
+Stacking leverages the strengths of each individual portfolio optimization by
+using their outputs as inputs to a final portfolio optimization.
 
 To avoid data leakage, out-of-sample estimates are used to fit the outer
 optimization.
@@ -772,3 +792,227 @@ The `cv` parameter can also be a combinatorial cross-validation, such as
 collection of multiple paths instead of one single path. The selected out-of-sample path
 among this collection of paths is chosen according to the `quantile` and
 `quantile_measure` parameters.
+
+.. _tracking_error_optimization:
+
+Tracking Error Optimization
+****************************
+
+Tracking error measures the deviation between a portfolio's performance and a benchmark.
+`skfolio` provides three approaches for tracking error optimization:
+
+1. **Return-based tracking error constraint** (via `max_tracking_error`):
+   Constrains the tracking error while optimizing another objective (e.g., minimize CVaR).
+
+2. **Weight-based target** (via `target_weights`):
+   Minimizes tracking error by finding weights that minimize deviation from a target
+   portfolio allocation.
+
+3. **Return-based target** (via :class:`BenchmarkTracker`):
+   Minimizes tracking error by optimizing on excess returns (portfolio returns
+   minus benchmark returns).
+
+**Example 1: Return-based tracking error constraint**
+
+Minimize CVaR while constraining the tracking error to 0.30% vs a benchmark:
+
+.. code-block:: python
+
+    from sklearn.model_selection import train_test_split
+
+    from skfolio import RiskMeasure
+    from skfolio.datasets import load_sp500_dataset, load_sp500_index
+    from skfolio.optimization import MeanRisk, ObjectiveFunction
+    from skfolio.preprocessing import prices_to_returns
+
+    prices = load_sp500_dataset()
+    spx_prices = load_sp500_index()
+
+    X, y = prices_to_returns(prices, spx_prices)
+    X_train, X_test, factors_train, factors_test = train_test_split(X, factors, test_size=0.33, shuffle=False)
+
+    model = MeanRisk(
+        objective_function=ObjectiveFunction.MINIMIZE_RISK,
+        risk_measure=RiskMeasure.CVAR,
+        max_tracking_error=0.003,  # 0.30% tracking error constraint
+    )
+    model.fit(X_train, factors=factors_train)
+    print(model.weights_)
+
+    portfolio = model.predict(X_test)
+    print(portfolio.cvar)
+
+**Example 2: Weight-based target**
+
+Minimize tracking error vs an equal-weighted target portfolio:
+
+.. code-block:: python
+
+    from sklearn.model_selection import train_test_split
+
+    import numpy as np
+    from skfolio import RiskMeasure
+    from skfolio.datasets import load_sp500_dataset
+    from skfolio.optimization import MeanRisk, ObjectiveFunction
+    from skfolio.preprocessing import prices_to_returns
+
+    prices = load_sp500_dataset()
+
+    X = prices_to_returns(prices)
+    X_train, X_test = train_test_split(X, test_size=0.33, shuffle=False)
+
+    # Define target portfolio (e.g., equal-weighted)
+    n_assets = X.shape[1]
+    target_weights = np.ones(n_assets) / n_assets
+
+    model = MeanRisk(
+        objective_function=ObjectiveFunction.MINIMIZE_RISK,
+        risk_measure=RiskMeasure.STANDARD_DEVIATION,
+        target_weights=target_weights,
+    )
+    model.fit(X_train)
+    print(model.weights_)
+
+    portfolio = model.predict(X_test)
+    print(portfolio.annualized_sharpe_ratio)
+
+**Example 3: Return-based target**
+
+Minimize tracking error vs a benchmark's returns:
+
+.. code-block:: python
+
+    from sklearn.model_selection import train_test_split
+
+    from skfolio import RiskMeasure
+    from skfolio.datasets import load_sp500_dataset, load_sp500_index
+    from skfolio.optimization import BenchmarkTracker
+    from skfolio.preprocessing import prices_to_returns
+
+    prices = load_sp500_dataset()
+    benchmark_prices = load_sp500_index()
+
+    X, y = prices_to_returns(prices, benchmark_prices)
+    X_train, X_test, factors_train, factors_test = train_test_split(
+        X, y["SP500"], test_size=0.33, shuffle=False
+    )
+
+    model = BenchmarkTracker(
+        risk_measure=RiskMeasure.STANDARD_DEVIATION,
+    )
+    model.fit(X_train, factors=factors_train)
+    print(model.weights_)
+
+    portfolio = model.predict(X_test)
+    # Compare portfolio returns to benchmark
+    excess_returns = portfolio.returns - y_test.values
+    tracking_error = np.std(excess_returns, ddof=1)
+    print(f"Tracking Error: {tracking_error:0.2%}")
+
+Fallbacks
+*********
+
+Optimization can sometimes fail during a given rebalancing. For example, a convex
+mean-variance problem with strict risk or sector constraints may become infeasible on
+specific dates.
+
+All optimization estimators accept a `fallback` parameter that can be either a single
+estimator or a list of estimators. When the primary optimization raises during `fit`,
+the models in `fallback` are tried in order until one succeeds. The fitted weights and
+core fitted attributes are copied back to the original estimator so you can keep a
+single reference in your workflow. Fallbacks can also be set to the string
+`previous_weights` to reuse the latest available allocation when the primary fit fails.
+
+Each attempt is recorded in `fallback_chain_`, and the successful estimator is available
+through `fallback_`.
+
+This mechanism is critical in automated production, where optimization failures
+shouldn't interrupt pipelines and where you need reproducibility and auditability.
+It can also be used to loosen optimization constraints gradually.
+
+Example: The primary model is a minimum-variance optimization made intentionally
+infeasible (the assets' minimum weights are set to 10%, which exceeds the feasible
+upper bound of 1/n_assets = 5%). As a fallback, we provide a feasible minimum-variance
+model with a 2% minimum weight constraint:
+
+.. code-block:: python
+
+    model = MeanRisk(
+    min_weights=0.1,  # intentionally infeasible
+    fallback=MeanRisk(min_weights=0.02),  # feasible fallback
+    )
+    model.fit(X_train)
+    print(model.weights_)
+
+    # Let's retrieve the fitted fallback that produced the final result:
+    print(model.fallback_)
+    # Let's display the sequence of attempts and their outcomes:
+    print(model.fallback_chain_)
+    # The fallback audit trail is also propagated to the predicted portfolio:
+    portfolio = model.predict(X_test)
+    assert portfolio.fallback_chain == model.fallback_chain_
+
+When calling `predict`, the selected fallback and the full attempt log are propagated
+to the resulting portfolio via `fallback_chain`.
+
+
+For a step-by-step tutorial and more details, see
+:ref:`sphx_glr_auto_examples_mean_risk_plot_17_failure_and_fallbacks.py`.
+
+
+Failure Handling
+****************
+In research, cross-validation and hyperparameter tuning (e.g., walk-forward, multiple
+randomized cross-validation), it's often useful to let all runs complete while keeping
+a full record of failures instead of stopping on the first failed rebalancing.
+
+The behavior on optimization failure is controlled by the `raise_on_failure`
+parameter.
+
+- If `raise_on_failure=True` (default): any error raised by the primary estimator is
+  re-raised after fallbacks are exhausted. No `weights_` are set, and calling
+  `predict` before a successful `fit` raises a `NotFittedError`.
+- If `raise_on_failure=False`: errors are not raised. Instead, a warning is
+  emitted, `weights_` is set to `None`, and `predict` returns a
+  :class:`~skfolio.portfolio.FailedPortfolio` that carries diagnostics.
+
+Diagnostics are exposed via:
+
+- `error_`: the stringified error of the failed fit.
+- `fallback_chain_`: a sequence of attempts with outcomes (`"success"` or the
+  error message), starting from the primary estimator.
+
+For online workflows based on `partial_fit`, the estimator first updates its stateful
+components, such as the prior and moment estimators, then solves the next portfolio.
+The `raise_on_failure` policy applies to solver failures at that rebalance. Errors raised
+while updating stateful components are still raised because the estimator state may be
+incomplete. The only fallback supported by `partial_fit` is
+`fallback="previous_weights"`, which reuses the latest valid allocation. Estimator
+fallbacks are reserved for regular `fit`, where each fallback can be fitted on the
+complete training window.
+
+Example: proceed without raising and retrieve failure diagnostics
+
+.. code-block:: python
+
+    from skfolio import RiskMeasure
+    from skfolio.optimization import MeanRisk, ObjectiveFunction
+
+    # Configure an intentionally infeasible problem
+    model = MeanRisk(
+        min_weights=1.0,
+        raise_on_failure=False,  # do not raise; collect diagnostics instead
+    )
+
+    model.fit(X_train)  # does not raise; weights_ is None on failure
+    print(model.error_)          # stringified error message
+    print(model.fallback_chain_) # attempts and outcomes
+
+    ptf = model.predict(X_test)  # returns a FailedPortfolio sentinel
+    print(type(ptf).__name__)    # "FailedPortfolio"
+    print(ptf.optimization_error)
+    print(ptf.fallback_chain)
+
+
+For a complete tutorial illustrating failure handling and fallbacks, see
+:ref:`sphx_glr_auto_examples_mean_risk_plot_17_failure_and_fallbacks.py`.

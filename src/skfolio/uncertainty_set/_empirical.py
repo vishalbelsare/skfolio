@@ -1,24 +1,27 @@
 """Empirical Uncertainty Set estimators."""
 
-# Copyright (c) 2023
-# Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# Copyright (c) 2023-2026
+# Author: Hugo Delatte <hugo.delatte@skfoliolabs.com>
+# SPDX-License-Identifier: BSD-3-Clause
 # Implementation derived from:
 # Riskfolio-Lib, Copyright (c) 2020-2023, Dany Cajas, Licensed under BSD 3 clause.
 # scikit-learn, Copyright (c) 2007-2010 David Cournapeau, Fabian Pedregosa, Olivier
 # Grisel Licensed under BSD 3 clause.
 
+from __future__ import annotations
+
 import numpy as np
-import numpy.typing as npt
+import scipy.linalg as sla
 import scipy.stats as st
 import sklearn.utils.metadata_routing as skm
 
 from skfolio.prior import BasePrior, EmpiricalPrior
+from skfolio.typing import ArrayLike
 from skfolio.uncertainty_set._base import (
     BaseCovarianceUncertaintySet,
     BaseMuUncertaintySet,
-    UncertaintySet,
 )
+from skfolio.uncertainty_set._model import UncertaintySet
 from skfolio.utils.stats import commutation_matrix
 from skfolio.utils.tools import check_estimator
 
@@ -28,26 +31,36 @@ class EmpiricalMuUncertaintySet(BaseMuUncertaintySet):
 
     Compute the expected returns ellipsoidal uncertainty set [1]_:
 
-    .. math:: U_{\mu}=\left\{\mu\,|\left(\mu-\hat{\mu}\right)S^{-1}\left(\mu-\hat{\mu}\right)^{T}\leq\kappa^{2}\right\}
+    .. math::
+
+        U_{\mu}
+        =
+        \left\{
+            \mu :
+            (\mu - \hat{\mu})^\top S^{-1}(\mu - \hat{\mu})
+            \le \kappa^2
+        \right\}.
 
     Under the assumption that :math:`\Sigma` is given, the distribution of the sample
     estimator :math:`\hat{\mu}` based on an i.i.d. sample
     :math:`R_{t}\sim N(\mu, \Sigma), t=1,...,T` is given by
     :math:`\hat{\mu}\sim N(\mu, \frac{1}{T}\Sigma)`.
 
-    The size of the ellipsoid  :math:`\kappa` (confidence region), is computed using:
+    The radius of the ellipsoid :math:`\kappa` (confidence region) is computed using:
 
-    .. math:: \kappa^2 = \chi^2_{n\_assets} (\beta)
+    .. math:: \kappa^2 = \chi^2_{n_{\text{assets}}}(\beta)
 
-    with :math:`\chi^2_{n\_assets}(\beta)` the inverse cumulative distribution function
-    of the chi-squared distribution with `n_assets` degrees of freedom at the
-    :math:`\beta` confidence level.
+    with :math:`\chi^2_{n_{\text{assets}}}(\beta)` the inverse cumulative distribution
+    function of the chi-squared distribution with :math:`n_{\text{assets}}` degrees of
+    freedom at the :math:`\beta` confidence level.
 
-    The Shape of the ellipsoid :math:`S` is computed using:
+    The shape matrix :math:`S` of the ellipsoid is computed using:
 
     .. math:: S = \frac{1}{T}\Sigma
 
     with the option to force the non-diagonal elements of the covariance matrix to zero.
+    The estimator stores the square-root factor as the linear geometry map
+    :math:`L = S^{1/2}`.
 
     Parameters
     ----------
@@ -55,13 +68,19 @@ class EmpiricalMuUncertaintySet(BaseMuUncertaintySet):
         The :ref:`prior estimator <prior>` used to estimate the assets covariance
         matrix. The default (`None`) is to use :class:`~skfolio.prior.EmpiricalPrior`.
 
-    confidence_level : float , default=0.95
+    confidence_level : float, default=0.95
         Confidence level :math:`\beta` of the inverse cumulative distribution function
         of the chi-squared distribution. The default value is `0.95`.
 
     diagonal : bool, default=True
-        If this is set to True, the non-diagonal elements of the covariance matrix are
-        set to zero.
+        If `True`, the non-diagonal elements of the covariance matrix are set to zero.
+
+    n_eff : float, optional
+        Effective number of observations used for the mean estimator. If `None`,
+        the number of observations in `X` is used. This is useful when the expected
+        returns are estimated using a different window length or a weighted estimator
+        (e.g. EWMA), in which case `n_eff` should be set to the corresponding effective
+        sample size.
 
     Attributes
     ----------
@@ -71,26 +90,36 @@ class EmpiricalMuUncertaintySet(BaseMuUncertaintySet):
     prior_estimator_ : BasePrior
         Fitted `prior_estimator`.
 
+    n_eff_ : float
+        Effective number of observations actually used to build the uncertainty set.
+
     References
     ----------
     .. [1]  "Robustness properties of mean-variance portfolios",
         Optimization: A Journal of Mathematical Programming and Operations Research,
         Schöttle & Werner (2009).
+
+    .. [2] "Portfolio Optimization: Theory and Application", Chapter 14,
+        Daniel P. Palomar (2025)
     """
+
+    n_eff_: float
 
     def __init__(
         self,
         prior_estimator: BasePrior | None = None,
         confidence_level: float = 0.95,
         diagonal: bool = True,
+        n_eff: float | None = None,
     ):
         super().__init__(prior_estimator=prior_estimator)
         self.confidence_level = confidence_level
         self.diagonal = diagonal
+        self.n_eff = n_eff
 
     def fit(
-        self, X: npt.ArrayLike, y: npt.ArrayLike | None = None, **fit_params
-    ) -> "EmpiricalMuUncertaintySet":
+        self, X: ArrayLike, y: ArrayLike | None = None, **fit_params
+    ) -> EmpiricalMuUncertaintySet:
         """Fit the Empirical Mu Uncertainty set estimator.
 
         Parameters
@@ -105,7 +134,7 @@ class EmpiricalMuUncertaintySet(BaseMuUncertaintySet):
         **fit_params : dict
             Parameters to pass to the underlying estimators.
             Only available if `enable_metadata_routing=True`, which can be
-            set by using ``sklearn.set_config(enable_metadata_routing=True)``.
+            set by using `sklearn.set_config(enable_metadata_routing=True)`.
             See :ref:`Metadata Routing User Guide <metadata_routing>` for
             more details.
 
@@ -124,15 +153,19 @@ class EmpiricalMuUncertaintySet(BaseMuUncertaintySet):
         # fitting estimators
         self.prior_estimator_.fit(X, y, **routed_params.prior_estimator.fit)
 
-        prior_model = self.prior_estimator_.prior_model_
-        n_observations, n_assets = prior_model.returns.shape
-        k = np.sqrt(st.chi2.ppf(q=self.confidence_level, df=n_assets))
+        return_distribution = self.prior_estimator_.return_distribution_
+        n_observations, n_assets = return_distribution.returns.shape
+        self.n_eff_ = n_observations if self.n_eff is None else self.n_eff
 
-        sigma = prior_model.covariance / n_observations
+        radius = np.sqrt(st.chi2.ppf(q=self.confidence_level, df=n_assets))
+        covariance = return_distribution.covariance
+
         if self.diagonal:
-            sigma = np.diag(np.diag(sigma))
+            geometry = np.diag(np.sqrt(np.diagonal(covariance) / self.n_eff_))
+        else:
+            geometry = sla.sqrtm(covariance / self.n_eff_).real
 
-        self.uncertainty_set_ = UncertaintySet(k=k, sigma=sigma)
+        self.uncertainty_set_ = UncertaintySet(radius=radius, geometry=geometry, norm=2)
         return self
 
 
@@ -141,28 +174,47 @@ class EmpiricalCovarianceUncertaintySet(BaseCovarianceUncertaintySet):
 
     Compute the covariance ellipsoidal uncertainty set [1]_:
 
-    .. math:: U_{\Sigma}=\left\{\Sigma\,|\left(\text{vec}(\Sigma)-\text{vec}(\hat{\Sigma})\right)S^{-1}\left(\text{vec}(\Sigma)-\text{vec}(\hat{\Sigma})\right)^{T}\leq k^{2}\,,\,\Sigma\succeq 0\right\}
+    .. math::
+
+        U_{\Sigma}
+        =
+        \left\{
+            \Sigma :
+            d^\top S^{-1} d \le \kappa^2,
+            \Sigma \succeq 0
+        \right\},
+        \quad
+        d =
+        \operatorname{vec}(\Sigma) - \operatorname{vec}(\hat{\Sigma}).
 
     We consider the Wishart distribution for the covariance matrix:
 
     .. math:: \hat{\Sigma}\sim W(\frac{1}{T-1}\Sigma, T-1)
 
-    The size of the ellipsoid  :math:`\kappa` (confidence region), is computed using:
+    The radius of the ellipsoid :math:`\kappa` (confidence region) is computed using:
 
-    .. math:: \kappa^2 = \chi^2_{n\_assets^2} (\beta)
+    .. math:: \kappa^2 = \chi^2_{n_{\text{assets}}^2}(\beta)
 
-    with :math:`\chi^2_{n\_assets^2}(\beta)` the inverse cumulative distribution
-    function of the chi-squared distribution with `n_assets` degrees of freedom at the
-    :math:`\beta` confidence level.
+    with :math:`\chi^2_{n_{\text{assets}}^2}(\beta)` the inverse cumulative distribution
+    function of the chi-squared distribution with :math:`n_{\text{assets}}^2` degrees of
+    freedom at the :math:`\beta` confidence level.
 
-    The Shape of the ellipsoid :math:`S` is based on a closed form solution of the
-    covariance matrix of the Wishart distributed random variable by using the vector
-    notation :math:`vec(x)`:
+    The shape matrix :math:`S` of the ellipsoid is based on the covariance matrix of the
+    Wishart distributed random variable using the vector notation
+    :math:`\operatorname{vec}(x)`:
 
-    .. math:: Cov[vec(\hat{\Sigma})]=\frac{1}{T-1}(I_{n^2} + K_{nn})(\Sigma \otimes \Sigma)
+    .. math::
 
-    with :math:`K_{nn}` denoting a commutation matrix and :math:`\otimes` representing
-    the Kronecker product.
+        \operatorname{Cov}[\operatorname{vec}(\hat{\Sigma})]
+        =
+        \frac{1}{n_{\text{eff}}}
+        (I_{n^2} + K_{nn})(\Sigma \otimes \Sigma).
+
+    where :math:`K_{nn}` denotes a commutation matrix and :math:`\otimes` represents
+    the Kronecker product. If `diagonal` is `True`, the asset covariance estimate is
+    diagonalized and the linear geometry map :math:`L` is built directly from the
+    diagonal of :math:`S`. Otherwise, the estimator stores a full square-root factor
+    :math:`L = S^{1/2}`.
 
     Parameters
     ----------
@@ -175,8 +227,15 @@ class EmpiricalCovarianceUncertaintySet(BaseCovarianceUncertaintySet):
         of the chi-squared distribution. The default value is `0.95`.
 
     diagonal : bool, default=True
-        If this is set to True, the non-diagonal elements of the covariance matrix are
-        set to zero.
+        If `True`, the non-diagonal elements of the asset covariance matrix are set to
+        zero before building the ellipsoid shape matrix.
+
+    n_eff : float, optional
+        Effective number of observations used for the covariance estimator. If `None`,
+        the number of observations in `X` is used. This is useful when the covariance
+        matrix is estimated using a different window length or a weighted estimator
+        (e.g. EWMA), in which case `n_eff` should be set to the corresponding effective
+        sample size.
 
     Attributes
     ----------
@@ -186,26 +245,36 @@ class EmpiricalCovarianceUncertaintySet(BaseCovarianceUncertaintySet):
     prior_estimator_ : BasePrior
         Fitted `prior_estimator`.
 
+    n_eff_ : float
+        Effective number of observations actually used to build the uncertainty set.
+
     References
     ----------
     .. [1]  "Robustness properties of mean-variance portfolios",
         Optimization: A Journal of Mathematical Programming and Operations Research,
         Schöttle & Werner (2009).
+
+    .. [2] "Portfolio Optimization: Theory and Application", Chapter 14,
+        Daniel P. Palomar (2025)
     """
+
+    n_eff_: float
 
     def __init__(
         self,
         prior_estimator: BasePrior | None = None,
         confidence_level: float = 0.95,
         diagonal: bool = True,
+        n_eff: float | None = None,
     ):
         super().__init__(prior_estimator=prior_estimator)
         self.confidence_level = confidence_level
         self.diagonal = diagonal
+        self.n_eff = n_eff
 
     def fit(
-        self, X: npt.ArrayLike, y: npt.ArrayLike | None = None, **fit_params
-    ) -> "EmpiricalCovarianceUncertaintySet":
+        self, X: ArrayLike, y: ArrayLike | None = None, **fit_params
+    ) -> EmpiricalCovarianceUncertaintySet:
         """Fit the Empirical Covariance Uncertainty set estimator.
 
         Parameters
@@ -220,7 +289,7 @@ class EmpiricalCovarianceUncertaintySet(BaseCovarianceUncertaintySet):
         **fit_params : dict
             Parameters to pass to the underlying estimators.
             Only available if `enable_metadata_routing=True`, which can be
-            set by using ``sklearn.set_config(enable_metadata_routing=True)``.
+            set by using `sklearn.set_config(enable_metadata_routing=True)`.
             See :ref:`Metadata Routing User Guide <metadata_routing>` for
             more details.
 
@@ -239,21 +308,25 @@ class EmpiricalCovarianceUncertaintySet(BaseCovarianceUncertaintySet):
         # fitting estimators
         self.prior_estimator_.fit(X, y, **routed_params.prior_estimator.fit)
 
-        prior_model = self.prior_estimator_.prior_model_
-        n_observations, n_assets = prior_model.returns.shape
-        k = np.sqrt(st.chi2.ppf(q=self.confidence_level, df=n_assets**2))
+        return_distribution = self.prior_estimator_.return_distribution_
+        n_observations, n_assets = return_distribution.returns.shape
+        self.n_eff_ = n_observations if self.n_eff is None else self.n_eff
 
-        sigma = prior_model.covariance / n_observations
+        radius = np.sqrt(st.chi2.ppf(q=self.confidence_level, df=n_assets**2))
+        covariance = return_distribution.covariance
+
         if self.diagonal:
-            sigma = np.diag(np.diag(sigma))
-
-        sigma = np.diag(
-            np.diag(
-                n_observations
-                * (np.identity(n_assets**2) + commutation_matrix(sigma))
-                @ np.kron(sigma, sigma)
+            covariance_diag = np.diagonal(covariance)
+            shape_diag = np.kron(covariance_diag, covariance_diag) / self.n_eff_
+            shape_diag[:: n_assets + 1] *= 2
+            geometry = np.diag(np.sqrt(shape_diag))
+        else:
+            shape = (
+                (np.identity(n_assets**2) + commutation_matrix(covariance))
+                @ np.kron(covariance, covariance)
+                / self.n_eff_
             )
-        )
+            geometry = sla.sqrtm(shape).real
 
-        self.uncertainty_set_ = UncertaintySet(k=k, sigma=sigma)
+        self.uncertainty_set_ = UncertaintySet(radius=radius, geometry=geometry, norm=2)
         return self

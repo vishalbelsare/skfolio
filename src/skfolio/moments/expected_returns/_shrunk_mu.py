@@ -1,26 +1,29 @@
 """Shrinkage Expected Returns (Mu) Estimators."""
 
-# Copyright (c) 2023
-# Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# Copyright (c) 2023-2026
+# Author: Hugo Delatte <hugo.delatte@skfoliolabs.com>
+# SPDX-License-Identifier: BSD-3-Clause
 # Implementation derived from:
 # Riskfolio-Lib, Copyright (c) 2020-2023, Dany Cajas, Licensed under BSD 3 clause.
 # scikit-learn, Copyright (c) 2007-2010 David Cournapeau, Fabian Pedregosa, Olivier
 # Grisel Licensed under BSD 3 clause.
 
+from __future__ import annotations
+
 from enum import auto
 
 import numpy as np
-import numpy.typing as npt
 import sklearn.utils.metadata_routing as skm
+import sklearn.utils.validation as skv
 
 from skfolio.moments.covariance import BaseCovariance, EmpiricalCovariance
 from skfolio.moments.expected_returns._base import BaseMu
+from skfolio.typing import ArrayLike, FloatArray
 from skfolio.utils.tools import AutoEnum, check_estimator
 
 
 class ShrunkMuMethods(AutoEnum):
-    """Shrinkage methods for the ShrunkMu estimator
+    """Shrinkage methods for the ShrunkMu estimator.
 
     Parameters
     ----------
@@ -126,7 +129,7 @@ class ShrunkMu(BaseMu):
     """
 
     covariance_estimator_: BaseCovariance
-    mu_target_: np.ndarray
+    mu_target_: FloatArray
     alpha_: float
     beta_: float
 
@@ -148,7 +151,7 @@ class ShrunkMu(BaseMu):
         )
         return router
 
-    def fit(self, X: npt.ArrayLike, y=None, **fit_params) -> "ShrunkMu":
+    def fit(self, X: ArrayLike, y=None, **fit_params) -> ShrunkMu:
         """Fit the ShrunkMu estimator model.
 
         Parameters
@@ -162,7 +165,7 @@ class ShrunkMu(BaseMu):
         **fit_params : dict
             Parameters to pass to the underlying estimators.
             Only available if `enable_metadata_routing=True`, which can be
-            set by using ``sklearn.set_config(enable_metadata_routing=True)``.
+            set by using `sklearn.set_config(enable_metadata_routing=True)`.
             See :ref:`Metadata Routing User Guide <metadata_routing>` for
             more details.
 
@@ -189,7 +192,7 @@ class ShrunkMu(BaseMu):
 
         # we validate and convert to numpy after all models have been fitted to keep
         # features names information.
-        X = self._validate_data(X)
+        X = skv.validate_data(self, X)
         n_observations, n_assets = X.shape
 
         covariance = self.covariance_estimator_.covariance_
@@ -208,7 +211,7 @@ class ShrunkMu(BaseMu):
         # Calculate Estimators
         match self.method:
             case ShrunkMuMethods.JAMES_STEIN:
-                eigenvalues = np.linalg.eigvals(covariance)
+                eigenvalues = np.linalg.eigvalsh(covariance)
                 self.beta_ = (
                     (np.sum(eigenvalues) - 2 * np.max(eigenvalues))
                     / np.sum((sample_mu - self.mu_target_) ** 2)
@@ -236,7 +239,8 @@ class ShrunkMu(BaseMu):
                     (u - n_assets / (n_observations - n_assets)) * w - v**2
                 ) / (u * w - v**2)
                 self.beta_ = (1 - self.alpha_) * v / u
-            case _:
+            # The type check above and the exhaustive enum cases cover all inputs.
+            case _:  # pragma: no cover
                 raise ValueError(f"method {self.method} is not valid")
 
         self.mu_ = self.alpha_ * sample_mu + self.beta_ * self.mu_target_

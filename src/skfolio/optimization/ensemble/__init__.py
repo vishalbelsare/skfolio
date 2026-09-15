@@ -1,6 +1,5 @@
-from skfolio.optimization.ensemble._stacking import (
-    BaseComposition,
-    StackingOptimization,
-)
+"""Ensemble Optimization module."""
 
-__all__ = ["BaseComposition", "StackingOptimization"]
+from skfolio.optimization.ensemble._stacking import StackingOptimization
+
+__all__ = ["StackingOptimization"]

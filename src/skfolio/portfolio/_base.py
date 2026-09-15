@@ -1,10 +1,10 @@
-"""Base Portfolio module"""
+"""Base Portfolio module."""
 
-# Copyright (c) 2023
-# Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# Copyright (c) 2023-2026
+# Author: Hugo Delatte <hugo.delatte@skfoliolabs.com>
+# SPDX-License-Identifier: BSD-3-Clause
 
-# The Portfolio class contains more than 40 measures than can be computationally
+# The Portfolio class contains more than 40 measures that can be computationally
 # expensive. The use of __slots__ instead of __dict__ is based on the following
 # consideration:
 #   * Fast Portfolio instantiation.
@@ -17,10 +17,10 @@
 #   * DRY by not re-writing @cached_property decorated methods for all the 40 measures.
 #
 # We define 7 types of attributes:
-#     * Public (read and right)
-#     * Private (read and right for private usage)
+#     * Public (read and write)
+#     * Private (read and write for private usage)
 #     * Read-only (handled in __setattr__)
-#     * Global abd local measures arguments: when they change, we clear the cache of
+#     * Global and local measures arguments: when they change, we clear the cache of
 #       all the measures (handled in __setattr__)
 #     * Attributes with custom getter and setter (using @property + private name
 #       in __slots__)
@@ -37,28 +37,36 @@
 #       the class attributes with the argument name preceded by the measure name and
 #       separated by '_'.
 
+from __future__ import annotations
+
 import warnings
 from abc import abstractmethod
+from collections.abc import Callable
+from functools import partial
 from typing import ClassVar
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import scipy.stats as st
 
 import skfolio.typing as skt
 from skfolio import measures as mt
+from skfolio._constants import _ANNUALIZATION_FACTOR_DEFAULT, _RISK_FREE_RATE
 from skfolio.measures import (
     ExtraRiskMeasure,
     PerfMeasure,
     RatioMeasure,
     RiskMeasure,
 )
+from skfolio.typing import FloatArray, IntArray
 from skfolio.utils.sorting import dominate
 from skfolio.utils.tools import (
     args_names,
     cached_property_slots,
     format_measure,
+    optimal_rounding_decimals,
 )
 
 _ZERO_THRESHOLD = 1e-5
@@ -66,6 +74,31 @@ _MEASURES = {
     e for enu in [PerfMeasure, RiskMeasure, ExtraRiskMeasure, RatioMeasure] for e in enu
 }
 _MEASURES_VALUES = {e.value: e for e in _MEASURES}
+
+_MEASURE_LOCAL_PARAMS = frozenset(
+    {
+        "value_at_risk_beta",
+        "cvar_beta",
+        "entropic_risk_measure_theta",
+        "entropic_risk_measure_beta",
+        "evar_beta",
+        "drawdown_at_risk_beta",
+        "cdar_beta",
+        "edar_beta",
+    }
+)
+_MEASURE_GLOBAL_PARAMS = frozenset(
+    {
+        "min_acceptable_return",
+        "compounded",
+        _RISK_FREE_RATE,
+    }
+)
+_PORTFOLIO_MEASURE_PARAMS = (
+    _MEASURE_GLOBAL_PARAMS
+    | _MEASURE_LOCAL_PARAMS
+    | {"annualization_factor", "fitness_measures"}
+)
 
 
 class BasePortfolio:
@@ -93,7 +126,7 @@ class BasePortfolio:
         compute domination.
         The default (`None`) is to use the list [PerfMeasure.MEAN, RiskMeasure.VARIANCE]
 
-    annualized_factor : float, default=252.0
+    annualization_factor : float, default=252.0
         Factor used to annualize the below measures using the square-root rule:
 
             * Annualized Mean = Mean * factor
@@ -110,6 +143,10 @@ class BasePortfolio:
     compounded : bool, default=False
         If this is set to True, cumulative returns are compounded.
         The default is `False`.
+
+    sample_weight : ndarray of shape (n_observations,), optional
+        Sample weights for each observation. The weights must sum to one.
+         If None, equal weights are assumed.
 
     min_acceptable_return : float, optional
         The minimum acceptable return used to distinguish "downside" and "upside"
@@ -371,23 +408,13 @@ class BasePortfolio:
         "returns",
         "cumulative_returns",
         "drawdowns",
-        "min_acceptable_return",
-        "compounded",
-        "risk_free_rate",
-    }
+        "sample_weight",
+    } | set(_MEASURE_GLOBAL_PARAMS)
 
     # Arguments locally used in measures computation
-    _measure_local_args: ClassVar[set] = {
-        "value_at_risk_beta",
-        "cvar_beta",
-        "entropic_risk_measure_theta",
-        "entropic_risk_measure_beta",
-        "evar_beta",
-        "drawdown_at_risk_beta",
-        "cdar_beta",
-        "edar_beta",
-    }
+    _measure_local_args: ClassVar[set] = set(_MEASURE_LOCAL_PARAMS)
 
+    # ruff: noqa: RUF023
     __slots__ = {
         # public
         "tag",
@@ -399,7 +426,8 @@ class BasePortfolio:
         "_loaded",
         # custom getter and setter
         "_fitness_measures",
-        "_annualized_factor",
+        "_annualization_factor",
+        "_sample_weight",
         # custom getter (read-only and cached)
         "_fitness",
         "_cumulative_returns",
@@ -474,14 +502,15 @@ class BasePortfolio:
 
     def __init__(
         self,
-        returns: np.ndarray | list,
-        observations: np.ndarray | list,
+        returns: FloatArray | list,
+        observations: FloatArray | list,
         name: str | None = None,
         tag: str | None = None,
-        annualized_factor: float = 252.0,
+        annualization_factor: float | None = None,
         fitness_measures: list[skt.Measure] | None = None,
         risk_free_rate: float = 0.0,
         compounded: bool = False,
+        sample_weight: FloatArray | None = None,
         min_acceptable_return: float | None = None,
         value_at_risk_beta: float = 0.95,
         entropic_risk_measure_theta: float = 1.0,
@@ -491,9 +520,15 @@ class BasePortfolio:
         drawdown_at_risk_beta: float = 0.95,
         cdar_beta: float = 0.95,
         edar_beta: float = 0.95,
+        **kwargs,
     ):
         self._loaded = False
-        self._annualized_factor = annualized_factor
+        self._annualization_factor = _resolve_annualization_factor(
+            annualization_factor,
+            kwargs,
+            owner_name=type(self).__name__,
+        )
+        self._sample_weight = sample_weight
         self.returns = np.asarray(returns)
         self.observations = np.asarray(observations)
         self.risk_free_rate = risk_free_rate
@@ -518,10 +553,13 @@ class BasePortfolio:
 
     def __reduce__(self):
         # For fast serialization and deserialization
-        # We don't want to serialize generic slots but only init arguments
-        return self.__class__, tuple(
-            [getattr(self, arg) for arg in args_names(self.__init__)]
-        )
+        # We don't want to serialize generic slots but only init arguments.
+        # Save them by name so constructor parameter order can change.
+        return partial(type(self), **self._get_init_params()), ()
+
+    def _get_init_params(self) -> dict:
+        """Return the parameters needed to reconstruct this portfolio."""
+        return {arg: getattr(self, arg) for arg in args_names(self.__init__)}
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.name}>"
@@ -598,7 +636,7 @@ class BasePortfolio:
                     f"`{type(self).__name__}` object has no attribute '{name}'"
                 ) from None
 
-    def __array__(self) -> np.ndarray:
+    def __array__(self) -> FloatArray:
         return self.returns
 
     # Private methods
@@ -611,8 +649,15 @@ class BasePortfolio:
     @property
     @abstractmethod
     def composition(self) -> pd.DataFrame:
-        """DataFrame of the Portfolio composition"""
-        pass
+        """DataFrame of the Portfolio composition."""
+        ...
+
+    @abstractmethod
+    def contribution(
+        self, measure: skt.Measure, spacing: float | None = None, to_df: bool = True
+    ) -> FloatArray | pd.DataFrame:
+        """Compute the contribution of each asset to a given measure."""
+        ...
 
     # Custom attribute setter and getter
     @property
@@ -633,19 +678,51 @@ class BasePortfolio:
         delattr(self, "_fitness")
 
     @property
-    def annualized_factor(self) -> float:
-        """Portfolio annualized factor."""
-        return self._annualized_factor
+    def annualization_factor(self) -> float:
+        """Portfolio annualization factor."""
+        return self._annualization_factor
 
+    @annualization_factor.setter
+    def annualization_factor(self, value: float) -> None:
+        self._annualization_factor = value
+        self.clear()
+
+    # TODO remove deprecated annualized_factor in v2.0
+    @property
+    def annualized_factor(self) -> float:
+        """Deprecated alias for `annualization_factor`."""
+        _warn_deprecated_annualized_factor(stacklevel=3)
+        return self.annualization_factor
+
+    # TODO remove deprecated annualized_factor in v2.0
     @annualized_factor.setter
     def annualized_factor(self, value: float) -> None:
-        self._annualized_factor = value
-        self.clear()
+        _warn_deprecated_annualized_factor(stacklevel=3)
+        self.annualization_factor = value
+
+    @property
+    def sample_weight(self) -> float:
+        """Observations sample weights."""
+        return self._sample_weight
+
+    @sample_weight.setter
+    def sample_weight(self, value: FloatArray | None) -> None:
+        if value is not None:
+            value = np.asarray(value)
+            if value.ndim != 1:
+                raise ValueError("sample_weight must be a 1D array.")
+            if len(value) != self.n_observations:
+                raise ValueError(
+                    "sample_weight must have the same length as the number of observations."
+                )
+            if not np.isclose(value.sum(), 1):
+                raise ValueError("sample_weight must sum to one.")
+        self._sample_weight = value
 
     # Custom attribute getter (read-only and cached)
     @cached_property_slots
-    def fitness(self) -> np.ndarray:
-        """The Portfolio fitness."""
+    def fitness(self) -> FloatArray:
+        """Portfolio fitness."""
         res = []
         for measure in self.fitness_measures:
             if isinstance(measure, PerfMeasure | RatioMeasure):
@@ -656,21 +733,25 @@ class BasePortfolio:
         return np.array(res)
 
     @cached_property_slots
-    def cumulative_returns(self) -> np.ndarray:
-        """Portfolio cumulative returns array."""
+    def cumulative_returns(self) -> FloatArray:
+        """Portfolio cumulative returns array.
+        Non-compounded (arithmetic) cumulative returns start at 0.
+        Compounded (geometric) cumulative returns are expressed as a wealth index,
+        starting at 1.0 (i.e., the value of $1 invested).
+        """
         return mt.get_cumulative_returns(
-            returns=self.returns, compounded=self.compounded
+            returns=self.returns, compounded=self.compounded, base=1.0
         )
 
     @cached_property_slots
-    def drawdowns(self) -> np.ndarray:
+    def drawdowns(self) -> FloatArray:
         """Portfolio drawdowns array."""
         return mt.get_drawdowns(returns=self.returns, compounded=self.compounded)
 
     # Classic property
     @property
     def n_observations(self) -> int:
-        """Number of observations"""
+        """Number of observations."""
         return len(self.observations)
 
     @property
@@ -680,11 +761,24 @@ class BasePortfolio:
 
     @property
     def cumulative_returns_df(self) -> pd.Series:
-        """Portfolio cumulative returns Series."""
+        """Portfolio cumulative returns Series.
+        Non-compounded (arithmetic) cumulative returns start at 0.
+        Compounded (geometric) cumulative returns are expressed as a wealth index,
+        starting at 1.0 (i.e., the value of $1 invested).
+        """
         return pd.Series(
             index=self.observations,
             data=self.cumulative_returns,
             name="cumulative_returns",
+        )
+
+    @property
+    def drawdowns_df(self) -> pd.Series:
+        """Portfolio drawdowns Series."""
+        return pd.Series(
+            index=self.observations,
+            data=self.drawdowns,
+            name="drawdowns",
         )
 
     @property
@@ -700,7 +794,7 @@ class BasePortfolio:
         return self.__copy__()
 
     def clear(self) -> None:
-        """Clear all measures, fitness, cumulative returns and drawdowns in slots"""
+        """Clear all measures, fitness, cumulative returns and drawdowns in slots."""
         attrs = ["_fitness", "_cumulative_returns", "_drawdowns"]
         for attr in attrs + list(_MEASURES_VALUES):
             delattr(self, attr)
@@ -728,19 +822,9 @@ class BasePortfolio:
             # Local measures function arguments need to be defined in the class
             # attributes with the argument name preceded by the measure name and
             # separated by "_".
-            if measure.is_annualized:
-                func = getattr(mt, str(measure.non_annualized_measure.value))
-            else:
-                func = getattr(mt, str(measure.value))
 
-            args = {
-                arg: (
-                    getattr(self, arg)
-                    if arg in self._measure_global_args
-                    else getattr(self, f"{measure.value}_{arg}")
-                )
-                for arg in args_names(func)
-            }
+            func, args = self._get_measure_func(measure=measure)
+
             try:
                 value = func(**args)
                 if measure in [
@@ -748,12 +832,12 @@ class BasePortfolio:
                     RiskMeasure.ANNUALIZED_VARIANCE,
                     RiskMeasure.ANNUALIZED_SEMI_VARIANCE,
                 ]:
-                    value *= self.annualized_factor
+                    value *= self.annualization_factor
                 elif measure in [
                     RiskMeasure.ANNUALIZED_STANDARD_DEVIATION,
                     RiskMeasure.ANNUALIZED_SEMI_DEVIATION,
                 ]:
-                    value *= np.sqrt(self.annualized_factor)
+                    value *= np.sqrt(self.annualization_factor)
             except Exception as e:
                 warnings.warn(
                     f"Unable to calculate the portfolio '{measure.value}' with"
@@ -774,7 +858,7 @@ class BasePortfolio:
         return value
 
     def dominates(
-        self, other: "BasePortfolio", idx: slice | np.ndarray | None = None
+        self, other: BasePortfolio, idx: slice | IntArray | None = None
     ) -> bool:
         """Portfolio domination.
 
@@ -807,11 +891,11 @@ class BasePortfolio:
 
         Parameters
         ----------
-        measure : ct.Measure, default=RatioMeasure.SHARPE_RATIO
+        measure : Measure, default=RatioMeasure.SHARPE_RATIO
             The measure. The default measure is the Sharpe Ratio.
 
         window : int, default=30
-            The window size. The default value is `30`.
+            The window size. The default value is `30` observations.
 
         Returns
         -------
@@ -834,15 +918,7 @@ class BasePortfolio:
             risk_measure = non_annualized_measure
 
         if risk_measure is not None:
-            risk_func = getattr(mt, str(risk_measure.value))
-            risk_func_args = {
-                arg: (
-                    getattr(self, arg)
-                    if arg in self._measure_global_args
-                    else getattr(self, f"{risk_measure.value}_{arg}")
-                )
-                for arg in args_names(risk_func)
-            }
+            risk_func, risk_func_args = self._get_measure_func(measure=risk_measure)
 
             if "drawdowns" in risk_func_args:
                 del risk_func_args["drawdowns"]
@@ -884,14 +960,14 @@ class BasePortfolio:
                 RiskMeasure.ANNUALIZED_VARIANCE,
                 RiskMeasure.ANNUALIZED_SEMI_VARIANCE,
             ]:
-                rolling *= self.annualized_factor
+                rolling *= self.annualization_factor
             elif measure in [
                 RiskMeasure.ANNUALIZED_STANDARD_DEVIATION,
                 RiskMeasure.ANNUALIZED_SEMI_DEVIATION,
                 RatioMeasure.ANNUALIZED_SHARPE_RATIO,
                 RatioMeasure.ANNUALIZED_SORTINO_RATIO,
             ]:
-                rolling *= np.sqrt(self.annualized_factor)
+                rolling *= np.sqrt(self.annualization_factor)
         return rolling
 
     def summary(self, formatted: bool = True) -> pd.Series:
@@ -925,11 +1001,11 @@ class BasePortfolio:
                 key = f"{e!s} at {beta:.0%}"
             except AttributeError:
                 key = str(e)
-            if isinstance(e, RatioMeasure) or e in [
+            if e.is_ratio or e in [
+                RiskMeasure.VARIANCE,
+                RiskMeasure.SEMI_VARIANCE,
                 ExtraRiskMeasure.ENTROPIC_RISK_MEASURE,
                 RiskMeasure.ULCER_INDEX,
-                ExtraRiskMeasure.SKEW,
-                ExtraRiskMeasure.KURTOSIS,
             ]:
                 percent = False
             else:
@@ -942,18 +1018,19 @@ class BasePortfolio:
         return pd.Series(summary)
 
     def plot_cumulative_returns(
-        self, log_scale: bool = False, idx: slice | np.ndarray | None = None
+        self, log_scale: bool = False, idx: slice | IntArray | None = None
     ) -> go.Figure:
         """Plot the Portfolio cumulative returns.
-        Non-compounded cumulative returns start at 0.
-        Compounded cumulative returns are rescaled to start at 1000.
+        Non-compounded (arithmetic) cumulative returns start at 0.
+        Compounded (geometric) cumulative returns are expressed as a wealth index,
+        starting at 1.0 (i.e., the value of $1 invested).
 
         Parameters
         ----------
         log_scale : bool, default=False
             If this is set to True, the cumulative returns are displayed with a
-            logarithm scale on the y-axis and rebased at 1000. The cumulative returns
-            must be compounded otherwise an exception is raised.
+            logarithm scale on the y-axis. The cumulative returns must be compounded
+            otherwise an exception is raised.
 
         idx : slice | array, optional
             Indexes or slice of the observations to plot.
@@ -969,7 +1046,6 @@ class BasePortfolio:
         df = self.cumulative_returns_df.iloc[idx]
         title = "Cumulative Returns"
         if self.compounded:
-            yaxis_title = f"{title} (rebased at 1000)"
             if log_scale:
                 title = f"{title} (compounded & log scaled)"
             else:
@@ -981,26 +1057,58 @@ class BasePortfolio:
                     "returns that are compounded as opposed to non-compounded."
                     "You can change to compounded with `compounded=True`"
                 )
-            yaxis_title = title
             title = f"{title} (non-compounded)"
 
         fig = df.plot(backend="plotly")
         fig.update_layout(
             title=title,
             xaxis_title="Observations",
-            yaxis_title=yaxis_title,
+            yaxis_title="Cumulative Returns",
             showlegend=False,
         )
         if self.compounded:
-            fig.update_yaxes(tickformat=".0f")
+            fig.update_yaxes(tickformat=".2f")
         else:
             fig.update_yaxes(tickformat=".2%")
         if log_scale:
             fig.update_yaxes(type="log")
         return fig
 
-    def plot_returns(self, idx: slice | np.ndarray | None = None) -> go.Figure:
-        """Plot the Portfolio returns
+    def plot_drawdowns(self, idx: slice | IntArray | None = None) -> go.Figure:
+        """Plot the Portfolio drawdowns.
+
+        Parameters
+        ----------
+        idx : slice | array, optional
+            Indexes or slice of the observations to plot.
+            The default (`None`) is to plot all observations.
+
+        Returns
+        -------
+        plot : Figure
+            Returns the plot Figure object.
+        """
+        if idx is None:
+            idx = slice(None)
+        df = self.drawdowns_df.iloc[idx]
+        title = "Drawdowns"
+        if self.compounded:
+            title = f"{title} (compounded returns)"
+        else:
+            title = f"{title} (non-compounded returns)"
+
+        fig = df.plot(backend="plotly")
+        fig.update_layout(
+            title=title,
+            xaxis_title="Observations",
+            yaxis_title="Drawdowns",
+            showlegend=False,
+        )
+        fig.update_yaxes(tickformat=".1%")
+        return fig
+
+    def plot_returns(self, idx: slice | IntArray | None = None) -> go.Figure:
+        """Plot the Portfolio returns.
 
         Parameters
         ----------
@@ -1024,6 +1132,54 @@ class BasePortfolio:
         )
         return fig
 
+    def plot_returns_distribution(
+        self, percentile_cutoff: float | None = None
+    ) -> go.Figure:
+        """Plot the Portfolio returns distribution using Gaussian KDE.
+
+        Parameters
+        ----------
+        percentile_cutoff : float, default=None
+            Percentile cutoff for tail truncation (percentile), in percent.
+            If a float p is provided, the distribution support is truncated at the p-th
+            and (100 - p)-th percentiles.
+            If None, no truncation is applied (uses full min/max of returns).
+
+        Returns
+        -------
+        plot : Figure
+            Returns the plot Figure object
+        """
+        returns = self.returns
+        if percentile_cutoff is None:
+            lower, upper = returns.min(), returns.max()
+        else:
+            lower = np.percentile(returns, percentile_cutoff)
+            upper = np.percentile(returns, 100.0 - percentile_cutoff)
+
+        x = np.linspace(lower, upper, 500)
+        y = st.gaussian_kde(self.returns, weights=self.sample_weight)(x)
+
+        fig = go.Figure(
+            go.Scatter(
+                x=x,
+                y=y,
+                mode="lines",
+                fill="tozeroy",
+            )
+        )
+
+        fig.update_layout(
+            title="Returns Distribution",
+            xaxis_title="Returns",
+            yaxis_title="Probability Density",
+            showlegend=False,
+        )
+        fig.update_xaxes(
+            tickformat=".0%",
+        )
+        return fig
+
     def plot_rolling_measure(
         self,
         measure: skt.Measure = RatioMeasure.SHARPE_RATIO,
@@ -1033,7 +1189,7 @@ class BasePortfolio:
 
         Parameters
         ----------
-        measure : ct.Measure, default = RatioMeasure.SHARPE_RATIO
+        measure : Measure, default = RatioMeasure.SHARPE_RATIO
            The measure.
 
         window : int, default=30
@@ -1049,23 +1205,22 @@ class BasePortfolio:
         fig = rolling.plot(backend="plotly")
         fig.add_hline(
             y=getattr(self, measure.value),
-            line_width=1,
+            line_width=1.5,
             line_dash="dash",
             line_color="blue",
         )
-        max_val = rolling.max()
-        min_val = rolling.min()
-        if max_val > 0:
+        max_val = np.max(rolling)
+        min_val = np.min(rolling)
+        if max_val > 0 > min_val:
             fig.add_hrect(
                 y0=0, y1=max_val * 1.3, line_width=0, fillcolor="green", opacity=0.1
             )
-        if min_val < 0:
             fig.add_hrect(
                 y0=min_val * 1.3, y1=0, line_width=0, fillcolor="red", opacity=0.1
             )
 
         fig.update_layout(
-            title=f"rolling {measure} - {window} observations window",
+            title=f"Rolling {measure} - {window} observations window",
             xaxis_title="Observations",
             yaxis_title=str(measure),
             showlegend=False,
@@ -1089,3 +1244,109 @@ class BasePortfolio:
             legend_title_text="Assets",
         )
         return fig
+
+    def plot_contribution(self, measure: skt.Measure, spacing: float | None = None):
+        r"""Plot the contribution of each asset to a given measure.
+
+        Parameters
+        ----------
+        measure : Measure
+            The measure used for the contribution computation.
+
+        spacing : float, optional
+            Spacing "h" of the finite difference:
+            :math:`contribution(wi)= \frac{measure(wi-h) - measure(wi+h)}{2h}`
+
+        Returns
+        -------
+        plot : Figure
+            The plotly Figure of assets contribution to the measure.
+        """
+        df = self.contribution(measure=measure, spacing=spacing, to_df=True).T
+        fig = px.bar(df, x=df.index, y=df.columns)
+        yaxis = {
+            "title": "Contribution",
+        }
+        if not measure.is_ratio:
+            n = optimal_rounding_decimals(df.sum(axis=1).max())
+            yaxis["tickformat"] = f",.{n}%"
+
+        fig.update_layout(
+            title=f"{measure} Contribution",
+            xaxis_title="Portfolio",
+            yaxis=yaxis,
+            legend_title_text="Assets",
+        )
+        return fig
+
+    def _get_measure_func(self, measure: skt.Measure) -> tuple[Callable, dict]:
+        """Return the function and arguments of a given measure."""
+        if measure.is_annualized:
+            func = getattr(mt, str(measure.non_annualized_measure.value))
+        else:
+            func = getattr(mt, str(measure.value))
+
+        args = {}
+        for arg in args_names(func):
+            if arg in self._measure_global_args:
+                args[arg] = getattr(self, arg)
+            elif arg == "biased":
+                args[arg] = False
+            else:
+                args[arg] = getattr(self, f"{measure.value}_{arg}")
+        return func, args
+
+
+# TODO remove deprecated annualized_factor in v2.0
+def _warn_deprecated_annualized_factor(stacklevel: int = 2) -> None:
+    warnings.warn(
+        "`annualized_factor` is deprecated and will be removed in version 2.0. "
+        "Use `annualization_factor` instead.",
+        FutureWarning,
+        stacklevel=stacklevel,
+    )
+
+
+# TODO remove deprecated annualized_factor in v2.0
+def _normalize_annualization_factor_alias(params: dict, *, stacklevel: int = 2) -> dict:
+    """Normalize the deprecated `annualized_factor` key in a parameters dictionary."""
+    params = params.copy()
+    if "annualized_factor" not in params:
+        return params
+
+    annualized_factor = params.pop("annualized_factor")
+    annualization_factor = params.get("annualization_factor")
+    if annualization_factor is not None and annualized_factor is not None:
+        raise ValueError(
+            "`annualized_factor` is deprecated; pass only `annualization_factor`."
+        )
+    if annualized_factor is not None:
+        _warn_deprecated_annualized_factor(stacklevel=stacklevel)
+        params["annualization_factor"] = annualized_factor
+    elif "annualization_factor" not in params:
+        # Preserve an explicit deprecated `None` so it can override a value from a
+        # lower-precedence parameter source and resolve to the constructor default.
+        params["annualization_factor"] = None
+    return params
+
+
+def _resolve_annualization_factor(
+    annualization_factor: float | None,
+    kwargs: dict,
+    *,
+    owner_name: str,
+) -> float:
+    params = {"annualization_factor": annualization_factor}
+    if "annualized_factor" in kwargs:
+        params["annualized_factor"] = kwargs.pop("annualized_factor")
+    if len(kwargs) != 0:
+        key = next(iter(kwargs))
+        raise TypeError(
+            f"{owner_name}.__init__() got an unexpected keyword argument '{key}'"
+        )
+    annualization_factor = _normalize_annualization_factor_alias(params, stacklevel=6)[
+        "annualization_factor"
+    ]
+    if annualization_factor is None:
+        return _ANNUALIZATION_FACTOR_DEFAULT
+    return annualization_factor

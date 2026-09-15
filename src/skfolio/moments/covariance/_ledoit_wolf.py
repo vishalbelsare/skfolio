@@ -1,16 +1,18 @@
 """LedoitWolf Covariance Estimators."""
 
-# Copyright (c) 2023
-# Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# Copyright (c) 2023-2026
+# Author: Hugo Delatte <hugo.delatte@skfoliolabs.com>
+# SPDX-License-Identifier: BSD-3-Clause
 # Implementation derived from:
 # scikit-learn, Copyright (c) 2007-2010 David Cournapeau, Fabian Pedregosa, Olivier
 # Grisel Licensed under BSD 3 clause.
 
-import numpy.typing as npt
+from __future__ import annotations
+
 import sklearn.covariance as skc
 
 from skfolio.moments.covariance._base import BaseCovariance
+from skfolio.typing import ArrayLike
 
 
 class LedoitWolf(BaseCovariance, skc.LedoitWolf):
@@ -41,7 +43,7 @@ class LedoitWolf(BaseCovariance, skc.LedoitWolf):
 
     nearest : bool, default=True
         If this is set to True, the covariance is replaced by the nearest covariance
-        matrix that is positive definite and with a Cholesky decomposition than can be
+        matrix that is positive definite and with a Cholesky decomposition that can be
         computed. The variance is left unchanged.
         A covariance matrix that is not positive definite often occurs in high
         dimensional problems. It can be due to multicollinearity, floating-point
@@ -50,13 +52,13 @@ class LedoitWolf(BaseCovariance, skc.LedoitWolf):
         The default is `True`.
 
     higham : bool, default=False
-        If this is set to True, the Higham & Nick (2002) algorithm is used to find the
+        If this is set to True, the Higham (2002) algorithm is used to find the
         nearest PD covariance, otherwise the eigenvalues are clipped to a threshold
-        above zeros (1e-13). The default is `False` and use the clipping method as the
-        Higham & Nick algorithm can be slow for large datasets.
+        above zeros (1e-13). The default is `False` and uses the clipping method as the
+        Higham algorithm can be slow for large datasets.
 
     higham_max_iteration : int, default=100
-        Maximum number of iteration of the Higham & Nick (2002) algorithm.
+        Maximum number of iterations of the Higham (2002) algorithm.
         The default value is `100`.
 
     Attributes
@@ -119,7 +121,7 @@ class LedoitWolf(BaseCovariance, skc.LedoitWolf):
             block_size=block_size,
         )
 
-    def fit(self, X: npt.ArrayLike, y=None) -> "LedoitWolf":
+    def fit(self, X: ArrayLike, y=None, **fit_params) -> LedoitWolf:
         """Fit the Ledoit-Wolf shrunk covariance model to X.
 
         Parameters

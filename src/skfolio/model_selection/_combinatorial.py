@@ -1,27 +1,32 @@
-"""Combinatorial module"""
+"""Combinatorial module."""
 
-# Copyright (c) 2023
-# Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# Copyright (c) 2023-2026
+# Author: Hugo Delatte <hugo.delatte@skfoliolabs.com>
+# SPDX-License-Identifier: BSD-3-Clause
 # Implementation derived from:
 # scikit-portfolio, Copyright (c) 2022, Carlo Nicolini, Licensed under MIT Licence.
 # scikit-learn, Copyright (c) 2007-2010 David Cournapeau, Fabian Pedregosa, Olivier
 # Grisel Licensed under BSD 3 clause.
+
+from __future__ import annotations
 
 import itertools
 import math
 import numbers
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import numpy as np
-import numpy.typing as npt
 import pandas as pd
 import plotly.graph_objects as go
 import sklearn.model_selection as sks
 import sklearn.utils as sku
 
 import skfolio.typing as skt
+from skfolio.typing import ArrayLike, IntArray
+
+_MAX_COMBINATIONS = 100_000
 
 
 class BaseCombinatorialCV(ABC):
@@ -31,18 +36,16 @@ class BaseCombinatorialCV(ABC):
     """
 
     @abstractmethod
-    def split(self, X: npt.ArrayLike, y=None) -> tuple[np.ndarray, list[np.ndarray]]:
-        pass
+    def split(self, X: ArrayLike, y=None) -> tuple[IntArray, list[IntArray]]: ...
 
     @abstractmethod
-    def get_path_ids(self) -> np.ndarray:
-        """Return the path id of each test sets in each split"""
-        pass
+    def get_path_ids(self) -> IntArray:
+        """Return the path id of each test sets in each split."""
+        ...
 
     __repr__ = sks.BaseCrossValidator.__repr__
 
 
-# TODO: review params and function naming
 class CombinatorialPurgedCV(BaseCombinatorialCV):
     """Combinatorial Purged Cross-Validation.
 
@@ -58,10 +61,10 @@ class CombinatorialPurgedCV(BaseCombinatorialCV):
 
     To avoid data leakage, purging and embargoing can be performed.
 
-    Purging consist of removing from the training set all observations whose labels
+    Purging consists of removing from the training set all observations whose labels
     overlapped in time with those labels included in the testing set.
 
-    Embargoing consist of removing from the training set all observations that
+    Embargoing consists of removing from the training set all observations that
     immediately follow an observation in the testing set, since financial features
     often incorporate series that exhibit serial correlation (like ARMA processes).
 
@@ -89,6 +92,11 @@ class CombinatorialPurgedCV(BaseCombinatorialCV):
 
     Examples
     --------
+    Tutorials using `CombinatorialPurgedCV`:
+        * :ref:`sphx_glr_auto_examples_pre_selection_plot_1_drop_correlated.py`
+        * :ref:`sphx_glr_auto_examples_clustering_plot_3_hrp_vs_herc.py`
+        * :ref:`sphx_glr_auto_examples_clustering_plot_5_nco_grid_search.py`
+
     >>> import numpy as np
     >>> from skfolio.model_selection import CombinatorialPurgedCV
     >>> X = np.random.randn(12, 2)
@@ -153,7 +161,8 @@ class CombinatorialPurgedCV(BaseCombinatorialCV):
         Marcos López de Prado (2018)
     """
 
-    index_train_test_: np.ndarray
+    if TYPE_CHECKING:
+        index_train_test_: IntArray
 
     def __init__(
         self,
@@ -161,7 +170,7 @@ class CombinatorialPurgedCV(BaseCombinatorialCV):
         n_test_folds: int = 8,
         purged_size: int = 0,
         embargo_size: int = 0,
-    ):
+    ) -> None:
         if not isinstance(n_folds, numbers.Integral):
             raise ValueError(
                 "The number of folds must be of Integral type. "
@@ -189,6 +198,21 @@ class CombinatorialPurgedCV(BaseCombinatorialCV):
         if embargo_size < 0:
             raise ValueError("`embargo_size` cannot be negative")
 
+        n_combinations = math.comb(n_folds, n_test_folds)
+        if n_combinations > _MAX_COMBINATIONS:
+            raise ValueError(
+                f"The combination of `n_folds={n_folds}` and "
+                f"`n_test_folds={n_test_folds}` produces {n_combinations:,} splits, "
+                f"which exceeds the maximum allowed ({_MAX_COMBINATIONS:,}). "
+                f"Combinatorial Purged Cross-Validation is designed to generate a "
+                f"moderate number of backtest paths from train/test combinations "
+                f"(typically tens to a few thousands). A number this large likely "
+                f"indicates a misconfiguration rather than an intended use case, as "
+                f"each split requires a full model fit. "
+                f"Reduce `n_folds` or adjust `n_test_folds` further from `n_folds / 2` "
+                f"to decrease the number of combinations."
+            )
+
         self.n_folds = n_folds
         self.n_test_folds = n_test_folds
         self.purged_size = purged_size
@@ -196,26 +220,28 @@ class CombinatorialPurgedCV(BaseCombinatorialCV):
 
     @property
     def n_splits(self) -> int:
-        """Number of splits"""
+        """Number of splits."""
         return _n_splits(n_folds=self.n_folds, n_test_folds=self.n_test_folds)
 
     @property
     def n_test_paths(self) -> int:
         """Number of test paths that can be reconstructed from the train/test
-        combinations"""
+        combinations.
+        """
         return _n_test_paths(n_folds=self.n_folds, n_test_folds=self.n_test_folds)
 
     @property
-    def test_set_index(self) -> np.ndarray:
-        """Location of each test set"""
+    def test_set_index(self) -> IntArray:
+        """Location of each test set."""
         return np.array(
             list(itertools.combinations(np.arange(self.n_folds), self.n_test_folds))
         ).reshape(-1, self.n_test_folds)
 
     @property
-    def binary_train_test_sets(self) -> np.ndarray:
+    def binary_train_test_sets(self) -> IntArray:
         """Identify training and test folds for each combinations by assigning `0` to
-        training folds and `1` to test folds"""
+        training folds and `1` to test folds.
+        """
         folds_train_test = np.zeros((self.n_folds, self.n_splits))
         folds_train_test[
             self.test_set_index, np.arange(self.n_splits)[:, np.newaxis]
@@ -223,14 +249,14 @@ class CombinatorialPurgedCV(BaseCombinatorialCV):
         return folds_train_test
 
     @property
-    def recombined_paths(self) -> np.ndarray:
+    def recombined_paths(self) -> IntArray:
         """Recombine each test path by returning the test set location in each split."""
         return np.argwhere(self.binary_train_test_sets == 1)[:, 1].reshape(
             self.n_folds, -1
         )
 
-    def get_path_ids(self) -> np.ndarray:
-        """Return the path id of each test sets in each split"""
+    def get_path_ids(self) -> IntArray:
+        """Return the path id of each test sets in each split."""
         recombine_paths = self.recombined_paths
         path_ids = np.zeros((self.n_splits, self.n_test_folds), dtype=int)
         for i in range(self.n_splits):
@@ -238,16 +264,37 @@ class CombinatorialPurgedCV(BaseCombinatorialCV):
                 path_ids[i, j] = np.argwhere(recombine_paths == i)[j][1]
         return path_ids
 
+    def get_n_splits(self, X=None, y=None, groups=None) -> int:
+        """Return the number of splitting iterations in the cross-validator.
+
+        Parameters
+        ----------
+        X : object
+            Always ignored, exists for compatibility.
+
+        y : object
+            Always ignored, exists for compatibility.
+
+        groups : object
+            Always ignored, exists for compatibility.
+
+        Returns
+        -------
+        n_splits : int
+            Number of splitting iterations in the cross-validator.
+        """
+        return self.n_splits
+
     def split(
-        self, X: npt.ArrayLike, y=None, groups=None
-    ) -> Iterator[tuple[np.ndarray, list[np.ndarray]]]:
+        self, X: ArrayLike, y=None, groups=None
+    ) -> Iterator[tuple[IntArray, list[IntArray]]]:
         """Generate indices to split data into training and test set.
 
         Parameters
         ----------
         X : array-like of shape (n_samples, n_features)
-            Training data, where `n_samples` is the number of samples
-            and `n_features` is the number of features.
+            Training data, where `n_samples` is the number of samples and `n_features`
+            is the number of features.
 
         y : array-like of shape (n_samples,), optional
             The (multi-)target variable
@@ -334,7 +381,7 @@ class CombinatorialPurgedCV(BaseCombinatorialCV):
         )
 
     def plot_train_test_folds(self) -> skt.Figure:
-        """Plot the train/test fold locations"""
+        """Plot the train/test fold locations."""
         values = self.binary_train_test_sets
         fill_color = np.where(values == 0, "blue", "red")
         fill_color = fill_color.astype(object)
@@ -367,7 +414,8 @@ class CombinatorialPurgedCV(BaseCombinatorialCV):
 
     def plot_train_test_index(self, X) -> skt.Figure:
         """Plot the training and test indices for each combinations by assigning `0` to
-        training, `1` to test and `-1` to both purge and embargo indices."""
+        training, `1` to test and `-1` to both purge and embargo indices.
+        """
         next(self.split(X))
         n_samples = X.shape[0]
         cond = [
@@ -377,7 +425,7 @@ class CombinatorialPurgedCV(BaseCombinatorialCV):
         ]
         values = self.index_train_test_.T
         values = np.insert(values, 0, np.arange(n_samples), axis=0)
-        fill_color = np.select(cond, ["green", "blue", "red"]).T
+        fill_color = np.select(cond, ["green", "blue", "red"], default="green").T
         fill_color = fill_color.astype(object)
         fill_color = np.insert(
             fill_color, 0, np.array(["darkblue" for _ in range(n_samples)]), axis=0
@@ -425,12 +473,12 @@ def _n_splits(n_folds: int, n_test_folds: int) -> int:
     n_splits : int
         Number of splits
     """
-    return int(math.comb(n_folds, n_test_folds))
+    return math.comb(n_folds, n_test_folds)
 
 
 def _n_test_paths(n_folds: int, n_test_folds: int) -> int:
     """Number of test paths that can be reconstructed from the train/test
-    combinations
+    combinations.
 
     Parameters
     ----------
@@ -496,7 +544,7 @@ def optimal_folds_number(
     This is a combinatorial problem with :math:`\frac{T\times(T-3)}{2}` combinations,
     with :math:`T` the number of observations.
 
-    We reduce the search space by using the combinatorial symetry
+    We reduce the search space by using the combinatorial symmetry
     :math:`{n \choose k}={n \choose n-k}` and skipping cost computation above 1e5.
 
     Parameters

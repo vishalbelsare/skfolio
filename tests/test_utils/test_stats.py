@@ -1,26 +1,49 @@
+from __future__ import annotations
+
+import itertools
+import math
+
+import cvxpy as cp
 import numpy as np
 import pytest
 import scipy.cluster.hierarchy as sch
 import scipy.spatial.distance as scd
+from numpy.testing import assert_allclose
 
 from skfolio.cluster import LinkageMethod
 from skfolio.datasets import load_nasdaq_dataset, load_sp500_dataset
 from skfolio.distance import PearsonDistance
 from skfolio.preprocessing import prices_to_returns
 from skfolio.utils.stats import (
+    _forward_mean_return,
+    _market_returns,
     assert_is_distance,
     assert_is_square,
     assert_is_symmetric,
+    combination_by_index,
     commutation_matrix,
     compute_optimal_n_clusters,
     corr_to_cov,
     cov_nearest,
     cov_to_corr,
+    cs_pearson_correlation,
+    cs_rank,
+    cs_spearman_correlation,
+    inverse_multiply,
     is_cholesky_dec,
+    minimize_relative_weight_deviation,
+    multiply_by_inverse,
     n_bins_freedman,
     n_bins_knuth,
     rand_weights,
     rand_weights_dirichlet,
+    safe_cholesky,
+    safe_divide,
+    sample_unique_subsets,
+    squared_mahalanobis_dist,
+    squared_standardized_euclidean_dist,
+    symmetric_step_up_matrix,
+    symmetrize,
 )
 
 
@@ -44,8 +67,8 @@ def returns():
 
 
 @pytest.fixture(scope="module")
-def nasdaq_X():
-    prices = load_nasdaq_dataset()
+def nasdaq_X(remote_dataset):
+    prices = remote_dataset(load_nasdaq_dataset)
     nasdaq_X = prices_to_returns(prices)
     return nasdaq_X
 
@@ -69,9 +92,33 @@ def linkage_matrix(distance):
     return linkage_matrix
 
 
+@pytest.fixture()
+def weights():
+    weights = np.array(
+        [
+            0.15686274156862742,
+            0.09803922098039221,
+            0.07843137078431371,
+            0.12500000125000002,
+            0.20833333208333335,
+            0.3333333333333333,
+        ]
+    )
+    return weights
+
+
 def test_n_bins_freedman(returns):
     n_bins = n_bins_freedman(returns)
     assert n_bins == 329
+
+
+def test_n_bins_freedman_rejects_non_vector_input():
+    with pytest.raises(ValueError, match="1d-array"):
+        n_bins_freedman(np.ones((2, 2)))
+
+
+def test_n_bins_freedman_returns_default_for_constant_input():
+    assert n_bins_freedman(np.ones(10)) == 5
 
 
 def test_n_bins_knuth(returns):
@@ -80,9 +127,10 @@ def test_n_bins_knuth(returns):
 
 
 def test_cov_nearest(nasdaq_X):
-    cov = np.cov(np.array(nasdaq_X).T)
-    corr, std = cov_to_corr(cov)
-    eig_vals, _ = np.linalg.eigh(corr)
+    X = nasdaq_X.iloc[:100, :150]
+    cov = np.cov(np.array(X).T)
+    corr, _ = cov_to_corr(cov)
+    _, _ = np.linalg.eigh(corr)
     assert not is_cholesky_dec(cov)
     cov2 = cov_nearest(cov, higham=False)
     assert is_cholesky_dec(cov2)
@@ -252,6 +300,96 @@ def test_compute_optimal_n_clusters(distance, linkage_matrix):
     assert n_clusters == 4
 
 
+def test_inverse_multiply(X):
+    cov = np.cov(X.T)
+    a = cov[12:, :][:, :-12]
+    b = cov[:8, :][:, -12:]
+
+    r1 = inverse_multiply(a, b)
+    r2 = np.linalg.inv(a) @ b
+    np.testing.assert_array_almost_equal(r1, r2)
+
+
+def test_inverse_multiply_requires_compatible_dimensions():
+    with pytest.raises(ValueError, match="Wrong dimension"):
+        inverse_multiply(np.eye(2), np.ones(3))
+
+
+def test_multiply_by_inverse(X):
+    cov = np.cov(X.T)
+    a = cov[:12, :][:, -8:]
+    b = cov[12:, :][:, :-12]
+
+    r1 = multiply_by_inverse(a, b)
+    r2 = a @ np.linalg.inv(b)
+    np.testing.assert_array_almost_equal(r1, r2)
+
+
+@pytest.mark.parametrize("n1", [5])
+@pytest.mark.parametrize("n2", [4, 5, 6])
+def test_symmetric_step_up_matrix(n1, n2):
+    m = symmetric_step_up_matrix(n1, n2)
+    np.testing.assert_array_almost_equal(m @ np.ones(n2), np.ones(n1))
+
+
+class TestSymmetrize:
+    """Tests for the symmetrize utility."""
+
+    def test_full_matrix(self):
+        m = np.array([[1.0, 2.0], [4.0, 5.0]])
+        symmetrize(m)
+        np.testing.assert_array_equal(m, np.array([[1.0, 3.0], [3.0, 5.0]]))
+
+    def test_with_where_mask(self):
+        m = np.full((3, 3), np.nan)
+        m[:2, :2] = [[1.0, 2.0], [4.0, 5.0]]
+        where = np.array([True, True, False])
+        symmetrize(m, where=where)
+        np.testing.assert_array_equal(m[:2, :2], [[1.0, 3.0], [3.0, 5.0]])
+        assert np.all(np.isnan(m[2, :]))
+
+    def test_all_nan_is_noop(self):
+        m = np.full((2, 2), np.nan)
+        original = m.copy()
+        symmetrize(m, where=np.array([False, False]))
+        np.testing.assert_array_equal(np.isnan(m), np.isnan(original))
+
+    def test_inplace(self):
+        m = np.array([[1.0, 0.0], [2.0, 1.0]])
+        original_id = id(m)
+        result = symmetrize(m)
+        assert result is None
+        assert id(m) == original_id
+
+
+class TestSafeCholesky:
+    """Tests for the safe_cholesky utility."""
+
+    def test_zero_matrix_fallback_adds_positive_ridge(self):
+        cov = np.zeros((2, 2))
+        chol = safe_cholesky(cov)
+        reconstructed = chol @ chol.T
+        np.testing.assert_allclose(reconstructed, np.diag(np.diag(reconstructed)))
+        assert np.all(np.diag(reconstructed) > 0.0)
+
+    def test_fallback_symmetrizes_near_spd_matrix(self):
+        cov = np.array([[1.0, 1.0 + 1e-14], [1.0 - 1e-14, 1.0]])
+        chol = safe_cholesky(cov)
+        reconstructed = chol @ chol.T
+        np.testing.assert_allclose(reconstructed, np.array([[1.0, 1.0], [1.0, 1.0]]))
+
+    def test_does_not_mutate_input(self):
+        cov = np.zeros((2, 2))
+        cov_copy = cov.copy()
+        _ = safe_cholesky(cov)
+        np.testing.assert_array_equal(cov, cov_copy)
+
+    def test_raises_on_strongly_indefinite_matrix(self):
+        cov = np.array([[1.0, 2.0], [2.0, 1.0]])
+        with pytest.raises(ValueError, match="Cholesky failed"):
+            safe_cholesky(cov, max_tries=3)
+
+
 # Generated by CodiumAI
 class TestRandWeightsDirichlet:
     #  The function returns an array of n weights that sum to one.
@@ -389,6 +527,19 @@ class TestAssertIsDistance:
         with pytest.raises(ValueError):
             assert_is_distance(x)
 
+    def test_nonzero_diagonal(self):
+        with pytest.raises(ValueError, match="diagonal elements"):
+            assert_is_distance(np.eye(2))
+
+    def test_near_symmetric_distance_matrix(self):
+        x = np.array([[0.0, 0.3, 0.2], [0.3 + 5e-6, 0.0, 0.1], [0.2, 0.1, 0.0]])
+        assert_is_distance(x)
+
+    def test_near_symmetric_distance_matrix_above_tolerance(self):
+        x = np.array([[0.0, 0.3, 0.2], [0.3 + 2e-5, 0.0, 0.1], [0.2, 0.1, 0.0]])
+        with pytest.raises(ValueError):
+            assert_is_distance(x)
+
 
 # Generated by CodiumAI
 class TestCovToCorr:
@@ -404,6 +555,16 @@ class TestCovToCorr:
         # Assert
         assert isinstance(corr, np.ndarray)
         assert isinstance(std, np.ndarray)
+
+    def test_zero_variance_returns_nan_off_diagonal_and_unit_diagonal(self):
+        cov = np.array([[0.0, 0.0], [0.0, 4.0]])
+
+        corr, std = cov_to_corr(cov)
+
+        np.testing.assert_allclose(std, np.array([0.0, 2.0]))
+        np.testing.assert_allclose(np.diag(corr), 1.0)
+        assert np.isnan(corr[0, 1])
+        assert np.isnan(corr[1, 0])
 
     #  Should raise a ValueError when given a 1D ndarray as input
     def test_1d_input(self):
@@ -446,6 +607,39 @@ class TestCorrToCov:
         with pytest.raises(ValueError):
             corr_to_cov(corr, std)
 
+
+class TestSafeDivide:
+    def test_scalar_division(self):
+        assert safe_divide(6.0, 2.0) == 3.0
+
+    def test_zero_denominator_uses_fill_value(self):
+        assert np.isnan(safe_divide(1.0, 0.0, np.nan))
+
+    def test_near_zero_denominator_uses_fill_value(self):
+        assert np.isnan(safe_divide(1.0, 1e-14, np.nan, atol=1e-12))
+
+    def test_array_broadcasting(self):
+        result = safe_divide(
+            np.array([1.0, 2.0, 3.0]),
+            np.array([1.0, 0.0, 2.0]),
+            np.nan,
+        )
+        expected = np.array([1.0, np.nan, 1.5])
+        np.testing.assert_allclose(result, expected, equal_nan=True)
+
+    def test_non_finite_outputs_use_fill_value(self):
+        result = safe_divide(
+            np.array([np.nan, np.inf, 4.0]),
+            np.array([2.0, 2.0, 0.0]),
+            -1.0,
+        )
+        expected = np.array([-1.0, -1.0, -1.0])
+        np.testing.assert_allclose(result, expected)
+
+    def test_negative_atol_raises(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            safe_divide(1.0, 1.0, atol=-1e-12)
+
     #  Should raise a ValueError when the input correlation matrix is not a
     #  2D array
     def test_invalid_corr(self):
@@ -478,3 +672,751 @@ class TestCovNearest:
         cov = np.array([[1, 2], [3, 4]])
         with pytest.raises(ValueError):
             cov_nearest(cov)
+
+
+class TestMinimizeRelativeWeightDeviation:
+    def tests_no_constraints(self, weights):
+        new_weights = minimize_relative_weight_deviation(
+            weights=weights, min_weights=np.zeros(6), max_weights=np.ones(6)
+        )
+
+        np.testing.assert_array_almost_equal(weights, new_weights)
+
+    def tests_constraints(self, weights):
+        new_weights = minimize_relative_weight_deviation(
+            weights=weights, min_weights=np.ones(6) * 0.1, max_weights=np.ones(6) * 0.18
+        )
+
+        assert np.isclose(sum(new_weights), 1.0)
+        np.testing.assert_array_almost_equal(
+            new_weights, np.array([0.18, 0.16116994, 0.11883005, 0.18, 0.18, 0.18])
+        )
+
+    def test_non_feasible(self, weights):
+        with pytest.raises(cp.SolverError):
+            _ = minimize_relative_weight_deviation(
+                weights=weights, min_weights=np.zeros(6), max_weights=np.ones(6) * 0.1
+            )
+
+    @pytest.mark.parametrize(
+        "weights,min_weights,max_weights,error",
+        [
+            (np.array([0.5, 0.5]), np.zeros(1), np.ones(2), "same size"),
+            (
+                np.array([-0.1, 1.1]),
+                np.zeros(2),
+                np.ones(2),
+                "strictly positive",
+            ),
+            (
+                np.array([0.0, 1.0]),
+                np.zeros(2),
+                np.ones(2),
+                "strictly positive",
+            ),
+            (np.array([0.2, 0.2]), np.zeros(2), np.ones(2), "sum to one"),
+            (
+                np.array([0.5, 0.5]),
+                np.array([0.6, 0.0]),
+                np.array([0.5, 1.0]),
+                "lower or equal",
+            ),
+        ],
+    )
+    def test_invalid_inputs(self, weights, min_weights, max_weights, error):
+        with pytest.raises(ValueError, match=error):
+            minimize_relative_weight_deviation(weights, min_weights, max_weights)
+
+
+# Helper to generate all combinations for small N, k
+def generate_all_combinations(N: int, k: int):
+    return list(itertools.combinations(range(N), k))
+
+
+@pytest.mark.parametrize(
+    "N,k",
+    [
+        (5, 1),
+        (5, 2),
+        (5, 3),
+        (5, 5),
+        (6, 3),
+    ],
+)
+def test_unrank_all_positions(N, k):
+    """Test that it maps every possible index correctly for small N,k."""
+    all_combos = generate_all_combinations(N, k)
+    M = math.comb(N, k)
+    for idx in range(M):
+        expected = list(all_combos[idx])
+        result = combination_by_index(idx, N, k)
+        np.testing.assert_array_equal(expected, result)
+
+
+def test_unrank_invalid_index():
+    """Out-of-range indices should raise ValueError."""
+    with pytest.raises(ValueError):
+        combination_by_index(-1, 5, 2)
+    with pytest.raises(ValueError):
+        combination_by_index(math.comb(5, 2), 5, 2)
+
+
+def test_unrank_combination_full_cycle():
+    """Unranking all indices yields the full set of combinations exactly once."""
+    N, k = 7, 3
+    all_combos = generate_all_combinations(N, k)
+    M = math.comb(N, k)
+    results = [tuple(combination_by_index(i, N, k)) for i in range(M)]
+    assert set(results) == set(all_combos)
+    assert len(results) == len(all_combos)
+
+
+def test_unrank_edge_cases():
+    """Handle k=0 and k=N edge cases correctly."""
+    # k = 0: only one empty combination
+    np.testing.assert_array_equal(combination_by_index(0, 5, 0), [])
+    with pytest.raises(ValueError):
+        combination_by_index(1, 5, 0)
+
+    # k = N: only one full combination
+    np.testing.assert_array_equal(combination_by_index(0, 5, 5), [0, 1, 2, 3, 4])
+    with pytest.raises(ValueError):
+        combination_by_index(1, 5, 5)
+
+
+def test_sample_unique_subsets_properties():
+    n, k, n_subsets = 10, 4, 20
+    subs = sample_unique_subsets(n, k, n_subsets, random_state=1)
+    assert isinstance(subs, np.ndarray)
+    assert subs.shape == (n_subsets, k)
+    seen = set()
+    for row in subs:
+        lst = row.tolist()
+        assert len(lst) == k
+        assert lst == sorted(lst)
+        assert all(0 <= x < n for x in lst)
+        seen.add(tuple(lst))
+    assert len(seen) == n_subsets
+
+
+def test_sample_unique_subsets_full_cycle():
+    n, k = 5, 3
+    total = math.comb(n, k)
+    subs = sample_unique_subsets(n, k, total, random_state=42)
+    expected = set(generate_all_combinations(n, k))
+    actual = set(tuple(row.tolist()) for row in subs)
+    assert actual == expected
+    assert subs.shape[0] == total
+
+
+def test_sample_unique_subsets_big_comb():
+    n, k = 100, 10
+    total = math.comb(n, k)
+    assert total > 1e9
+    subs = sample_unique_subsets(n, k, 5, random_state=42)
+    assert subs.shape == (5, 10)
+
+
+def test_sample_unique_subsets_errors():
+    with pytest.raises(ValueError):
+        sample_unique_subsets(-1, 2, 1)
+    with pytest.raises(ValueError):
+        sample_unique_subsets(5, 6, 1)
+    with pytest.raises(ValueError):
+        sample_unique_subsets(5, 2, math.comb(5, 2) + 1)
+
+
+def test_edge_cases():
+    # k=0
+    arr0 = sample_unique_subsets(5, 0, 1, random_state=1)
+    assert isinstance(arr0, np.ndarray)
+    assert arr0.shape == (1, 0)
+    with pytest.raises(ValueError):
+        sample_unique_subsets(5, 0, 2)
+    # k=n
+    arr1 = sample_unique_subsets(4, 4, 1, random_state=2)
+    assert arr1.shape == (1, 4)
+    assert arr1.tolist() == [list(range(4))]
+    with pytest.raises(ValueError):
+        sample_unique_subsets(4, 4, 2)
+
+
+class TestSquaredStandardizedEuclideanDist:
+    """Tests for squared_standardized_euclidean_dist function."""
+
+    def test_identity_covariance(self):
+        """With identity covariance, result equals sum of squared returns."""
+        returns = np.array([1.0, 2.0, 3.0])
+        cov = np.eye(3)
+        result = squared_standardized_euclidean_dist(returns, cov)
+        expected = np.sum(returns**2)
+        assert np.isclose(result, expected)
+
+    def test_diagonal_covariance(self):
+        """With diagonal covariance, result is sum of (r_i / sigma_i)^2."""
+        returns = np.array([1.0, 2.0])
+        cov = np.array([[4.0, 0.0], [0.0, 9.0]])  # std = [2, 3]
+        result = squared_standardized_euclidean_dist(returns, cov)
+        expected = (1.0 / 2.0) ** 2 + (2.0 / 3.0) ** 2
+        assert np.isclose(result, expected)
+
+    def test_zero_returns(self):
+        """Zero returns should give zero distance."""
+        returns = np.zeros(3)
+        cov = np.eye(3)
+        result = squared_standardized_euclidean_dist(returns, cov)
+        assert result == 0.0
+
+    def test_non_negative(self):
+        """Result should always be non-negative."""
+        rng = np.random.default_rng(42)
+        returns = rng.standard_normal(5)
+        cov = rng.random((5, 5))
+        cov = cov @ cov.T + np.eye(5)  # Make positive definite
+        result = squared_standardized_euclidean_dist(returns, cov)
+        assert result >= 0.0
+
+
+class TestSquaredMahalanobisDist:
+    """Tests for squared_mahalanobis_dist function."""
+
+    def test_identity_covariance(self):
+        """With identity covariance, equals sum of squared returns."""
+        returns = np.array([1.0, 2.0, 3.0])
+        cov = np.eye(3)
+        result = squared_mahalanobis_dist(returns, cov)
+        expected = np.sum(returns**2)
+        assert np.isclose(result, expected)
+
+    def test_diagonal_covariance(self):
+        """With diagonal covariance, equals sum of (r_i / sigma_i)^2."""
+        returns = np.array([1.0, 2.0])
+        cov = np.array([[4.0, 0.0], [0.0, 9.0]])
+        result = squared_mahalanobis_dist(returns, cov)
+        expected = (1.0 / 2.0) ** 2 + (2.0 / 3.0) ** 2
+        assert np.isclose(result, expected)
+
+    def test_zero_returns(self):
+        """Zero returns should give zero distance."""
+        returns = np.zeros(3)
+        cov = np.eye(3)
+        result = squared_mahalanobis_dist(returns, cov)
+        assert result == 0.0
+
+    def test_non_negative(self):
+        """Result should always be non-negative."""
+        rng = np.random.default_rng(42)
+        returns = rng.standard_normal(5)
+        cov = rng.random((5, 5))
+        cov = cov @ cov.T + np.eye(5)
+        result = squared_mahalanobis_dist(returns, cov)
+        assert result >= 0.0
+
+    def test_correlated_covariance(self):
+        """Test with a correlated covariance matrix."""
+        returns = np.array([1.0, 1.0])
+        cov = np.array([[1.0, 0.5], [0.5, 1.0]])
+        result = squared_mahalanobis_dist(returns, cov)
+        # Analytical: r^T @ inv(cov) @ r
+        cov_inv = np.linalg.inv(cov)
+        expected = returns @ cov_inv @ returns
+        assert np.isclose(result, expected)
+
+    def test_ridge_regularization(self):
+        """Test that ridge regularization handles near-singular matrices."""
+        # Create a nearly singular covariance matrix
+        cov = np.array([[1.0, 0.9999], [0.9999, 1.0]])
+        returns = np.array([1.0, 1.0])
+        # Should not raise with ridge regularization
+        result = squared_mahalanobis_dist(returns, cov, ridge_scale=1e-6)
+        assert result >= 0.0
+
+    def test_does_not_mutate_input(self):
+        """Function should not mutate input covariance."""
+        returns = np.array([1.0, 2.0])
+        cov = np.array([[1.0, 0.5], [0.5, 1.0]])
+        cov_copy = cov.copy()
+        _ = squared_mahalanobis_dist(returns, cov)
+        np.testing.assert_array_equal(cov, cov_copy)
+
+    def test_2d_returns_multiple_observations(self):
+        """Test with 2D returns (multiple observations)."""
+        returns = np.array([[1.0, 2.0], [3.0, 4.0], [0.5, 1.5]])
+        cov = np.eye(2)
+        result = squared_mahalanobis_dist(returns, cov)
+        # With identity covariance, d^2 = sum of squared returns per row
+        expected = np.array([1**2 + 2**2, 3**2 + 4**2, 0.5**2 + 1.5**2])
+        np.testing.assert_allclose(result, expected)
+        assert result.shape == (3,)
+
+    def test_2d_returns_single_observation(self):
+        """Test with 2D returns (single observation, shape (1, n))."""
+        returns = np.array([[1.0, 2.0, 3.0]])
+        cov = np.eye(3)
+        result = squared_mahalanobis_dist(returns, cov)
+        expected = np.array([1**2 + 2**2 + 3**2])
+        np.testing.assert_allclose(result, expected)
+        assert result.shape == (1,)
+
+    def test_1d_returns_scalar_output(self):
+        """1D input should return a scalar float for backward compatibility."""
+        returns = np.array([1.0, 2.0, 3.0])
+        cov = np.eye(3)
+        result = squared_mahalanobis_dist(returns, cov)
+        assert isinstance(result, float)
+
+    def test_2d_returns_array_output(self):
+        """2D input should return an ndarray."""
+        returns = np.array([[1.0, 2.0], [3.0, 4.0]])
+        cov = np.eye(2)
+        result = squared_mahalanobis_dist(returns, cov)
+        assert isinstance(result, np.ndarray)
+
+    def test_mean_subtraction(self):
+        """Test mean parameter subtracts location from returns."""
+        returns = np.array([3.0, 5.0])
+        mean = np.array([1.0, 2.0])
+        cov = np.eye(2)
+        result = squared_mahalanobis_dist(returns, cov, mean=mean)
+        # (r - mu) = [2.0, 3.0], d^2 = 4 + 9 = 13
+        expected = (3.0 - 1.0) ** 2 + (5.0 - 2.0) ** 2
+        assert np.isclose(result, expected)
+
+    def test_mean_with_2d_returns(self):
+        """Test mean parameter with matrix returns."""
+        returns = np.array([[2.0, 4.0], [3.0, 5.0]])
+        mean = np.array([1.0, 2.0])
+        cov = np.eye(2)
+        result = squared_mahalanobis_dist(returns, cov, mean=mean)
+        # Row 0: (2-1)^2 + (4-2)^2 = 1 + 4 = 5
+        # Row 1: (3-1)^2 + (5-2)^2 = 4 + 9 = 13
+        expected = np.array([5.0, 13.0])
+        np.testing.assert_allclose(result, expected)
+
+    def test_mean_none_is_zero_centered(self):
+        """mean=None should be equivalent to mean=zeros."""
+        returns = np.array([1.0, 2.0])
+        cov = np.eye(2)
+        result_none = squared_mahalanobis_dist(returns, cov, mean=None)
+        result_zero = squared_mahalanobis_dist(returns, cov, mean=np.zeros(2))
+        assert np.isclose(result_none, result_zero)
+
+    def test_incompatible_covariance_shape_raises(self):
+        """Incompatible covariance shape should raise ValueError."""
+        returns = np.array([[1.0, 2.0, 3.0]])
+        cov = np.eye(2)  # Wrong size
+        with pytest.raises(ValueError, match="cholesky shape"):
+            squared_mahalanobis_dist(returns, cov)
+
+    def test_incompatible_mean_shape_raises(self):
+        """Incompatible mean shape should raise ValueError."""
+        returns = np.array([1.0, 2.0])
+        cov = np.eye(2)
+        mean = np.array([1.0, 2.0, 3.0])  # Wrong size
+        with pytest.raises(ValueError, match="mean must be 1D"):
+            squared_mahalanobis_dist(returns, cov, mean=mean)
+
+    def test_2d_mean_raises(self):
+        """2D mean should raise ValueError."""
+        returns = np.array([1.0, 2.0])
+        cov = np.eye(2)
+        mean = np.array([[1.0, 2.0]])  # 2D instead of 1D
+        with pytest.raises(ValueError, match="mean must be 1D"):
+            squared_mahalanobis_dist(returns, cov, mean=mean)
+
+
+class TestCsPearsonCorrelation:
+    """Tests for cs_pearson_correlation."""
+
+    def test_perfect_correlation(self):
+        a = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        b = np.array([2.0, 4.0, 6.0, 8.0, 10.0])
+        assert_allclose(cs_pearson_correlation(a, b), 1.0)
+
+    def test_perfect_negative_correlation(self):
+        a = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        b = np.array([10.0, 8.0, 6.0, 4.0, 2.0])
+        assert_allclose(cs_pearson_correlation(a, b), -1.0)
+
+    def test_zero_correlation(self):
+        a = np.array([1.0, -1.0, 1.0, -1.0])
+        b = np.array([1.0, 1.0, -1.0, -1.0])
+        assert_allclose(cs_pearson_correlation(a, b), 0.0, atol=1e-12)
+
+    def test_matches_numpy_corrcoef(self):
+        rng = np.random.default_rng(42)
+        a = rng.standard_normal(100)
+        b = rng.standard_normal(100)
+        expected = np.corrcoef(a, b)[0, 1]
+        assert_allclose(cs_pearson_correlation(a, b), expected)
+
+    def test_equal_weights_matches_unweighted(self):
+        rng = np.random.default_rng(7)
+        a = rng.standard_normal(50)
+        b = rng.standard_normal(50)
+        w = np.ones(50) * 3.0
+        assert_allclose(
+            cs_pearson_correlation(a, b, weights=w),
+            cs_pearson_correlation(a, b),
+        )
+
+    def test_weighted_shifts_result(self):
+        a = np.array([1.0, 2.0, 3.0, 10.0])
+        b = np.array([1.0, 2.0, 3.0, -5.0])
+        corr_equal = cs_pearson_correlation(a, b)
+        w_down_outlier = np.array([1.0, 1.0, 1.0, 0.01])
+        corr_weighted = cs_pearson_correlation(a, b, weights=w_down_outlier)
+        assert corr_weighted > corr_equal
+
+    def test_nan_handling(self):
+        a = np.array([1.0, 2.0, np.nan, 4.0, 5.0])
+        b = np.array([2.0, np.nan, 6.0, 8.0, 10.0])
+        result = cs_pearson_correlation(a, b)
+        valid = np.array([True, False, False, True, True])
+        expected = np.corrcoef(a[valid], b[valid])[0, 1]
+        assert_allclose(result, expected)
+
+    def test_min_count(self):
+        a = np.array([1.0, 2.0])
+        b = np.array([3.0, 4.0])
+        assert np.isnan(cs_pearson_correlation(a, b, min_count=3))
+        assert np.isfinite(cs_pearson_correlation(a, b, min_count=2))
+
+    def test_constant_vector_returns_nan(self):
+        a = np.array([5.0, 5.0, 5.0, 5.0])
+        b = np.array([1.0, 2.0, 3.0, 4.0])
+        assert np.isnan(cs_pearson_correlation(a, b))
+
+    def test_shape_mismatch_raises(self):
+        with pytest.raises(ValueError, match="broadcastable"):
+            cs_pearson_correlation(np.ones(3), np.ones(4))
+
+    def test_2d_vectorized_over_factors(self):
+        rng = np.random.default_rng(42)
+        n_assets, n_factors = 50, 4
+        a = rng.standard_normal((n_assets, n_factors))
+        b = rng.standard_normal((n_assets, n_factors))
+        result = cs_pearson_correlation(a, b, axis=0)
+        assert result.shape == (n_factors,)
+        for k in range(n_factors):
+            expected = np.corrcoef(a[:, k], b[:, k])[0, 1]
+            assert_allclose(result[k], expected, rtol=1e-10)
+
+    def test_3d_vectorized_over_time_and_factors(self):
+        rng = np.random.default_rng(42)
+        n_time, n_assets, n_factors = 10, 50, 3
+        a = rng.standard_normal((n_time, n_assets, n_factors))
+        b = rng.standard_normal((n_time, n_assets, n_factors))
+        result = cs_pearson_correlation(a, b, axis=1)
+        assert result.shape == (n_time, n_factors)
+        for t in range(n_time):
+            for k in range(n_factors):
+                expected = np.corrcoef(a[t, :, k], b[t, :, k])[0, 1]
+                assert_allclose(result[t, k], expected, rtol=1e-10)
+
+    def test_3d_with_weights(self):
+        rng = np.random.default_rng(42)
+        n_time, n_assets, n_factors = 5, 30, 2
+        a = rng.standard_normal((n_time, n_assets, n_factors))
+        b = rng.standard_normal((n_time, n_assets, n_factors))
+        w = rng.uniform(0.1, 1.0, size=(n_time, n_assets))
+        result = cs_pearson_correlation(a, b, weights=w, axis=1)
+        assert result.shape == (n_time, n_factors)
+        for val in result.ravel():
+            assert -1.0 <= val <= 1.0 or np.isnan(val)
+
+    def test_2d_axis1_with_1d_weights(self):
+        a = np.array([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]])
+        b = np.array([[1.0, 4.0, 9.0], [9.0, 4.0, 1.0]])
+        w = np.array([1.0, 2.0, 3.0])
+
+        result = cs_pearson_correlation(a, b, weights=w, axis=1)
+
+        expected = np.array(
+            [
+                cs_pearson_correlation(a[0], b[0], weights=w),
+                cs_pearson_correlation(a[1], b[1], weights=w),
+            ]
+        )
+        assert_allclose(result, expected)
+
+    def test_scalar_output_for_1d(self):
+        a = np.array([1.0, 2.0, 3.0])
+        b = np.array([4.0, 5.0, 6.0])
+        result = cs_pearson_correlation(a, b)
+        assert isinstance(result, float)
+
+    def test_nan_row_in_batch(self):
+        a = np.array([[1.0, 2.0], [np.nan, np.nan], [3.0, 4.0]])
+        b = np.array([[5.0, 6.0], [np.nan, np.nan], [7.0, 8.0]])
+        result = cs_pearson_correlation(a, b, axis=0, min_count=3)
+        assert result.shape == (2,)
+        assert all(np.isnan(result))
+
+    def test_2d_3d_fast_path_matches_1d_results(self):
+        rng = np.random.default_rng(43)
+        a = rng.normal(size=(7, 8))
+        b = rng.normal(size=(7, 8, 4))
+        weights = rng.random(size=(7, 8)) + 0.1
+        a[rng.random(a.shape) < 0.1] = np.nan
+        b[rng.random(b.shape) < 0.1] = np.nan
+
+        result = cs_pearson_correlation(a, b, weights=weights, axis=1)
+        expected = np.empty((a.shape[0], b.shape[2]))
+        for t in range(a.shape[0]):
+            for k in range(b.shape[2]):
+                expected[t, k] = cs_pearson_correlation(
+                    a[t], b[t, :, k], weights=weights[t]
+                )
+
+        assert_allclose(result, expected, equal_nan=True, atol=1e-12)
+
+    def test_2d_3d_fast_path_is_stable_with_large_offsets(self):
+        rng = np.random.default_rng(44)
+        a = 1e12 + rng.normal(size=(3, 100))
+        b = 1e12 + rng.normal(size=(3, 100, 2))
+        weights = rng.random(size=(3, 100)) + 0.1
+
+        result = cs_pearson_correlation(a, b, weights=weights, axis=1)
+        expected = np.empty((a.shape[0], b.shape[2]))
+        for t in range(a.shape[0]):
+            for k in range(b.shape[2]):
+                expected[t, k] = cs_pearson_correlation(
+                    a[t], b[t, :, k], weights=weights[t]
+                )
+
+        assert np.nanmax(np.abs(result)) <= 1.0
+        assert_allclose(result, expected, equal_nan=True, atol=1e-6)
+
+    def test_2d_3d_fast_path_is_symmetric(self):
+        rng = np.random.default_rng(45)
+        a = rng.normal(size=(6, 9))
+        b = rng.normal(size=(6, 9, 3))
+        weights = rng.random(size=(6, 9)) + 0.1
+
+        result = cs_pearson_correlation(a, b, weights=weights, axis=1)
+        symmetric = cs_pearson_correlation(b, a, weights=weights, axis=1)
+
+        assert_allclose(result, symmetric, equal_nan=True, atol=1e-12)
+
+    def test_2d_3d_fast_path_accepts_1d_weights(self):
+        rng = np.random.default_rng(46)
+        a = rng.normal(size=(5, 7))
+        b = rng.normal(size=(5, 7, 2))
+        weights = rng.random(7) + 0.1
+
+        result = cs_pearson_correlation(a, b, weights=weights, axis=1)
+        expected = np.empty((a.shape[0], b.shape[2]))
+        for t in range(a.shape[0]):
+            for k in range(b.shape[2]):
+                expected[t, k] = cs_pearson_correlation(
+                    a[t], b[t, :, k], weights=weights
+                )
+
+        assert_allclose(result, expected, equal_nan=True, atol=1e-12)
+
+    def test_3d_weights_use_generic_path(self):
+        rng = np.random.default_rng(47)
+        a_2d = rng.normal(size=(5, 7))
+        a = np.broadcast_to(a_2d[:, :, np.newaxis], (5, 7, 3)).copy()
+        b = rng.normal(size=(5, 7, 3))
+        weights = rng.random(size=(5, 7, 3)) + 0.1
+
+        result = cs_pearson_correlation(a, b, weights=weights, axis=1)
+        expected = np.empty((a.shape[0], a.shape[2]))
+        for t in range(a.shape[0]):
+            for k in range(a.shape[2]):
+                expected[t, k] = cs_pearson_correlation(
+                    a[t, :, k], b[t, :, k], weights=weights[t, :, k]
+                )
+
+        assert_allclose(result, expected, equal_nan=True, atol=1e-12)
+
+    def test_weighted_min_count_uses_positive_finite_weights(self):
+        a = np.array([1.0, 2.0, 3.0, 4.0])
+        b = np.array([1.0, 2.0, 3.0, 4.0])
+        weights = np.array([1.0, 1.0, 0.0, np.nan])
+
+        assert np.isnan(cs_pearson_correlation(a, b, weights=weights, min_count=3))
+        assert np.isfinite(cs_pearson_correlation(a, b, weights=weights, min_count=2))
+
+    def test_negative_weights_raise(self):
+        a = np.array([1.0, 2.0, 3.0])
+        b = np.array([1.0, 2.0, 3.0])
+        weights = np.array([1.0, -1.0, 1.0])
+
+        with pytest.raises(ValueError, match="non-negative"):
+            cs_pearson_correlation(a, b, weights=weights)
+
+    @pytest.mark.parametrize(
+        "weights,error",
+        [
+            (np.array([1.0, -1.0, 1.0]), "non-negative"),
+            (np.ones(2), "length must match"),
+            (np.ones((2, 2)), "must have shape"),
+        ],
+    )
+    def test_optimized_path_validates_weights(self, weights, error):
+        a = np.ones((2, 3))
+        b = np.ones((2, 3, 1))
+
+        with pytest.raises(ValueError, match=error):
+            cs_pearson_correlation(a, b, weights=weights, axis=1)
+
+    def test_generic_path_validates_weight_length(self):
+        with pytest.raises(ValueError, match="length must match"):
+            cs_pearson_correlation(
+                np.ones((2, 3)),
+                np.ones((2, 3)),
+                weights=np.ones(2),
+                axis=1,
+            )
+
+    def test_invalid_axis_raises_index_error(self):
+        with pytest.raises(IndexError, match="out of bounds"):
+            cs_pearson_correlation(np.ones(3), np.ones(3), axis=1)
+
+
+class TestCsRank:
+    """Tests for cs_rank."""
+
+    def test_basic_1d(self):
+        a = np.array([30.0, 10.0, 20.0])
+        expected = np.array([3.0, 1.0, 2.0])
+        assert_allclose(cs_rank(a), expected)
+
+    def test_nan_excluded(self):
+        a = np.array([30.0, np.nan, 10.0])
+        result = cs_rank(a)
+        assert np.isnan(result[1])
+        assert_allclose(result[0], 2.0)
+        assert_allclose(result[2], 1.0)
+
+    def test_2d_axis0(self):
+        a = np.array([[3.0, 1.0], [1.0, 3.0], [2.0, 2.0]])
+        result = cs_rank(a, axis=0)
+        assert result.shape == (3, 2)
+        assert_allclose(result[:, 0], [3.0, 1.0, 2.0])
+        assert_allclose(result[:, 1], [1.0, 3.0, 2.0])
+
+    def test_2d_axis1(self):
+        a = np.array([[30.0, 10.0, 20.0], [1.0, 3.0, 2.0]])
+        result = cs_rank(a, axis=1)
+        assert result.shape == (2, 3)
+        assert_allclose(result[0], [3.0, 1.0, 2.0])
+        assert_allclose(result[1], [1.0, 3.0, 2.0])
+
+    def test_3d(self):
+        rng = np.random.default_rng(42)
+        a = rng.standard_normal((5, 10, 3))
+        result = cs_rank(a, axis=1)
+        assert result.shape == (5, 10, 3)
+        assert np.all(np.isfinite(result))
+
+    def test_preserves_shape(self):
+        a = np.ones((2, 3, 4))
+        assert cs_rank(a, axis=1).shape == (2, 3, 4)
+
+    def test_all_nan_row(self):
+        a = np.array([np.nan, np.nan, np.nan])
+        result = cs_rank(a)
+        assert all(np.isnan(result))
+
+
+class TestCsSpearmanCorrelation:
+    """Tests for cs_spearman_correlation."""
+
+    def test_matches_scipy_spearmanr_1d(self):
+        from scipy.stats import spearmanr
+
+        rng = np.random.default_rng(42)
+        a = rng.standard_normal(100)
+        b = rng.standard_normal(100)
+        expected = spearmanr(a, b).statistic
+        assert_allclose(cs_spearman_correlation(a, b), expected, rtol=1e-10)
+
+    def test_perfect_monotonic(self):
+        a = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        b = np.array([10.0, 20.0, 30.0, 40.0, 50.0])
+        assert_allclose(cs_spearman_correlation(a, b), 1.0)
+
+    def test_perfect_negative_monotonic(self):
+        a = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        b = np.array([50.0, 40.0, 30.0, 20.0, 10.0])
+        assert_allclose(cs_spearman_correlation(a, b), -1.0)
+
+    def test_2d_vectorized(self):
+        from scipy.stats import spearmanr
+
+        rng = np.random.default_rng(42)
+        n_assets, n_factors = 50, 3
+        a = rng.standard_normal((n_assets, n_factors))
+        b = rng.standard_normal((n_assets, n_factors))
+        result = cs_spearman_correlation(a, b, axis=0)
+        assert result.shape == (n_factors,)
+        for k in range(n_factors):
+            expected = spearmanr(a[:, k], b[:, k]).statistic
+            assert_allclose(result[k], expected, rtol=1e-10)
+
+    def test_3d_vectorized(self):
+        from scipy.stats import spearmanr
+
+        rng = np.random.default_rng(42)
+        n_time, n_assets, n_factors = 5, 30, 2
+        a = rng.standard_normal((n_time, n_assets, n_factors))
+        b = rng.standard_normal((n_time, n_assets, n_factors))
+        result = cs_spearman_correlation(a, b, axis=1)
+        assert result.shape == (n_time, n_factors)
+        for t in range(n_time):
+            for k in range(n_factors):
+                expected = spearmanr(a[t, :, k], b[t, :, k]).statistic
+                assert_allclose(result[t, k], expected, rtol=1e-10)
+
+    def test_scalar_output_for_1d(self):
+        a = np.array([1.0, 2.0, 3.0])
+        b = np.array([4.0, 5.0, 6.0])
+        result = cs_spearman_correlation(a, b)
+        assert isinstance(result, float)
+
+    def test_shape_mismatch_raises(self):
+        with pytest.raises(ValueError, match="broadcastable"):
+            cs_spearman_correlation(np.ones(3), np.ones(4))
+
+    def test_pairwise_nan_matches_spearmanr(self):
+        from scipy.stats import spearmanr
+
+        a = np.array([1.0, 2.0, np.nan, 4.0, 5.0])
+        b = np.array([5.0, np.nan, 3.0, 2.0, 1.0])
+
+        valid = np.isfinite(a) & np.isfinite(b)
+        expected = spearmanr(a[valid], b[valid]).statistic
+
+        assert_allclose(cs_spearman_correlation(a, b), expected)
+
+
+class TestForwardMeanReturn:
+    def test_rejects_non_matrix_input(self):
+        with pytest.raises(ValueError, match="must be 2D"):
+            _forward_mean_return(np.ones(3))
+
+    def test_empty_input_preserves_number_of_assets(self):
+        result = _forward_mean_return(np.empty((0, 2)))
+
+        assert result.shape == (0, 2)
+        assert result.dtype == np.float64
+
+
+class TestMarketReturns:
+    def test_rejects_non_matrix_returns(self):
+        with pytest.raises(ValueError, match="asset_returns must be a 2D"):
+            _market_returns(np.ones(2), np.ones(2))
+
+    def test_rejects_mismatched_estimation_mask(self):
+        with pytest.raises(
+            ValueError, match="estimation_mask must have the same shape"
+        ):
+            _market_returns(
+                np.ones((2, 2)),
+                np.ones((2, 2)),
+                estimation_mask=np.ones((2, 1), dtype=bool),
+            )

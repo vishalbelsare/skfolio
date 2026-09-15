@@ -1,15 +1,21 @@
-"""Fast non-dominated sorting module"""
+"""Fast non-dominated sorting module."""
 
-# Copyright (c) 2023
-# Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# Copyright (c) 2023-2026
+# Author: Hugo Delatte <hugo.delatte@skfoliolabs.com>
+# SPDX-License-Identifier: BSD-3-Clause
+
+from __future__ import annotations
+
+import warnings
 
 import numpy as np
 
-__all__ = ["dominate", "non_denominated_sort"]
+from skfolio.typing import FloatArray
+
+__all__ = ["dominate", "non_denominated_sort", "non_dominated_sort"]
 
 
-def dominate(fitness_1: np.ndarray, fitness_2: np.ndarray) -> bool:
+def dominate(fitness_1: FloatArray, fitness_2: FloatArray) -> bool:
     """Compute the domination of two fitness arrays.
 
     Domination of `fitness_1` over `fitness_2` means that each objective (value) of
@@ -27,9 +33,9 @@ def dominate(fitness_1: np.ndarray, fitness_2: np.ndarray) -> bool:
     Returns
     -------
     is_dominated : bool
-        Ture if `fitness_1` dominates `fitness_2`, False otherwise.
+        True if `fitness_1` dominates `fitness_2`, False otherwise.
     """
-    if fitness_1.ndim != fitness_2.ndim != 1:
+    if fitness_1.ndim != 1 or fitness_2.ndim != 1:
         raise ValueError("fitness_1 and fitness_2 must be 1D array")
     not_equal = False
     for self_value, other_value in zip(fitness_1, fitness_2, strict=True):
@@ -40,8 +46,8 @@ def dominate(fitness_1: np.ndarray, fitness_2: np.ndarray) -> bool:
     return not_equal
 
 
-def non_denominated_sort(
-    fitnesses: np.ndarray, first_front_only: bool
+def non_dominated_sort(
+    fitnesses: FloatArray, first_front_only: bool
 ) -> list[list[int]]:
     """Fast non-dominated sorting.
 
@@ -99,7 +105,7 @@ def non_denominated_sort(
     if first_front_only:
         return fronts
 
-    # while not all solutions are assigned to a pareto front
+    # while not all solutions are assigned to a Pareto front
     while n_ranked < n:
         next_front = []
         # for each portfolio in the current front
@@ -116,3 +122,22 @@ def non_denominated_sort(
         current_front = next_front
 
     return fronts
+
+
+# TODO remove deprecated non_denominated_sort in v2.0
+def non_denominated_sort(
+    fitnesses: FloatArray, first_front_only: bool
+) -> list[list[int]]:
+    """Alias of :func:`non_dominated_sort`.
+
+    .. deprecated::
+        `non_denominated_sort` is deprecated and will be removed in version 2.0.
+        Use :func:`non_dominated_sort` instead.
+    """
+    warnings.warn(
+        "`non_denominated_sort` is deprecated and will be removed in version 2.0. "
+        "Use `non_dominated_sort` instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
+    return non_dominated_sort(fitnesses=fitnesses, first_front_only=first_front_only)

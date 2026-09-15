@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import numpy as np
 import pytest
-from sklearn import config_context
+from sklearn import clone, config_context
 
 from skfolio import RiskMeasure
 from skfolio.moments import ImpliedCovariance
@@ -9,7 +11,10 @@ from skfolio.optimization.convex import (
     MeanRisk,
     ObjectiveFunction,
 )
-from skfolio.prior import EmpiricalPrior
+from skfolio.prior import (
+    EmpiricalPrior,
+    EntropyPooling,
+)
 
 
 def test_distributionally_robust_cvar(X_small):
@@ -55,3 +60,107 @@ def test_metadata_routing(X_small, implied_vol_small):
 
     # noinspection PyUnresolvedReferences
     assert model.prior_estimator_.covariance_estimator_.r2_scores_.shape == (20,)
+
+
+def test_distributionally_robust_cvar_non_investable_nan_assets(
+    nan_investable_test_data, fixed_return_distribution_prior
+):
+    X, mu, covariance, investable_mask = nan_investable_test_data
+
+    model = DistributionallyRobustCVaR(
+        prior_estimator=fixed_return_distribution_prior(mu=mu, covariance=covariance),
+        wasserstein_ball_radius=0.001,
+    )
+    model.fit(X)
+
+    return_distribution = model.prior_estimator_.return_distribution_
+    assert return_distribution.n_assets == X.shape[1]
+    assert return_distribution.n_investable_assets == np.count_nonzero(investable_mask)
+    np.testing.assert_array_equal(model.investable_mask_, investable_mask)
+    assert model.weights_.shape == (X.shape[1],)
+    assert np.isfinite(model.weights_).all()
+    np.testing.assert_allclose(model.weights_[~investable_mask], 0)
+    np.testing.assert_allclose(model.weights_.sum(), 1)
+
+    portfolio = model.predict(X)
+    expected_returns = (
+        X.iloc[:, investable_mask].to_numpy() @ model.weights_[investable_mask]
+    )
+    np.testing.assert_allclose(portfolio.returns, expected_returns)
+
+
+def test_optim_with_equal_weighted_sample_weight(X_small):
+    """No sample weight and equal-weighted sample weight should give the same result"""
+    ref = DistributionallyRobustCVaR()
+    ref.fit(X_small)
+
+    model = DistributionallyRobustCVaR(prior_estimator=EntropyPooling())
+    model.fit(X_small)
+
+    np.testing.assert_almost_equal(model.weights_, ref.weights_, 6)
+
+
+@pytest.mark.parametrize(
+    "view_params,expected_weights",
+    [
+        (
+            dict(cvar_views=["PG == 0.06"]),
+            [
+                1.23663e-10,
+                4.55651e-11,
+                9.95123e-02,
+                4.30269e-11,
+                9.95123e-02,
+                9.95123e-02,
+                4.00570e-10,
+                9.95123e-02,
+                9.95123e-02,
+                6.63676e-10,
+                9.95123e-02,
+                9.95123e-02,
+                2.52827e-10,
+                3.93614e-09,
+                9.95123e-02,
+                1.76854e-09,
+                3.09124e-10,
+                9.95123e-02,
+                4.87690e-03,
+                9.95123e-02,
+            ],
+        ),
+    ],
+)
+def test_sample_weight(X_small, view_params, expected_weights):
+    ref = DistributionallyRobustCVaR(wasserstein_ball_radius=0.005)
+    ref.fit(X_small)
+
+    model = clone(ref)
+    model = model.set_params(prior_estimator=EntropyPooling(**view_params))
+    model.fit(X_small)
+
+    assert model.weights_[15] < ref.weights_[15]
+
+    np.testing.assert_almost_equal(model.weights_, expected_weights, 5)
+
+    ref_ptf = ref.predict(X_small)
+    ptf = model.predict(X_small)
+
+    assert ref_ptf.cvar < ptf.cvar
+
+    sample_weight = model.prior_estimator_.return_distribution_.sample_weight
+
+    ref_ptf.sample_weight = sample_weight
+    ptf.sample_weight = sample_weight
+
+    assert ref_ptf.cvar > ptf.cvar
+
+
+def test_distributionally_robust_cvar_non_default_solver():
+    # Any solver other than CLARABEL falls through to empty params. SCIPY ships
+    # with cvxpy, so it is available wherever skfolio is installed.
+    rng = np.random.default_rng(0)
+    X = rng.normal(0.0005, 0.01, (60, 6))
+    model = DistributionallyRobustCVaR(solver="SCIPY")
+    model.fit(X)
+    assert model._solver_params == {}
+    np.testing.assert_almost_equal(np.sum(model.weights_), 1.0, 4)

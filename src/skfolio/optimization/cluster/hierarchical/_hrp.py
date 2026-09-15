@@ -1,16 +1,18 @@
 """Hierarchical Risk Parity Optimization estimator."""
 
-# Copyright (c) 2023
-# Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# Copyright (c) 2023-2026
+# Author: Hugo Delatte <hugo.delatte@skfoliolabs.com>
+# SPDX-License-Identifier: BSD-3-Clause
 # The risk measure generalization and constraint features are derived
 # from Riskfolio-Lib, Copyright (c) 2020-2023, Dany Cajas, Licensed under BSD 3 clause.
 
+from __future__ import annotations
+
 import numpy as np
-import numpy.typing as npt
 import pandas as pd
 import scipy.cluster.hierarchy as sch
 import sklearn.utils.metadata_routing as skm
+import sklearn.utils.validation as skv
 
 import skfolio.typing as skt
 from skfolio.cluster import HierarchicalClustering
@@ -20,6 +22,7 @@ from skfolio.optimization.cluster.hierarchical._base import (
     BaseHierarchicalOptimization,
 )
 from skfolio.prior import BasePrior, EmpiricalPrior
+from skfolio.typing import ArrayLike, FloatArray
 from skfolio.utils.tools import bisection, check_estimator
 
 
@@ -27,11 +30,11 @@ class HierarchicalRiskParity(BaseHierarchicalOptimization):
     r"""Hierarchical Risk Parity estimator.
 
     Hierarchical Risk Parity is a portfolio optimization method developed by Marcos
-    Lopez de Prado [2]_.
+    Lopez de Prado [1]_.
 
     This algorithm uses a distance matrix to compute hierarchical clusters using the
     Hierarchical Tree Clustering algorithm. It then employs seriation to rearrange the
-    assets in the dendrogram, minimizing the distance between leafs.
+    assets in the dendrogram, minimizing the distance between leaves.
 
     The final step is the recursive bisection where each cluster is split between two
     sub-clusters by starting with the topmost cluster and traversing in a top-down
@@ -45,7 +48,7 @@ class HierarchicalRiskParity(BaseHierarchicalOptimization):
         multiple risk measures and linkage methods.
         The default linkage method is set to the Ward
         variance minimization algorithm, which is more stable and has better properties
-        than the single-linkage method [4]_.
+        than the single-linkage method [2]_.
 
     Parameters
     ----------
@@ -72,15 +75,13 @@ class HierarchicalRiskParity(BaseHierarchicalOptimization):
             * ENTROPIC_RISK_MEASURE
             * FOURTH_CENTRAL_MOMENT
             * FOURTH_LOWER_PARTIAL_MOMENT
-            * SKEW
-            * KURTOSIS
 
         The default is `RiskMeasure.VARIANCE`.
 
     prior_estimator : BasePrior, optional
         :ref:`Prior estimator <prior>`.
-        The prior estimator is used to estimate the :class:`~skfolio.prior.PriorModel`
-        containing the estimation of assets expected returns, covariance matrix and
+        The prior estimator is used to estimate the :class:`~skfolio.prior.ReturnDistribution`
+        containing estimates of expected asset returns, covariance matrix and
         returns. The moments and returns estimations are used for the risk computation
         and the returns estimation are used by the distance matrix estimator.
         The default (`None`) is to use :class:`~skfolio.prior.EmpiricalPrior`.
@@ -99,36 +100,35 @@ class HierarchicalRiskParity(BaseHierarchicalOptimization):
         :class:`~skfolio.cluster.HierarchicalClustering`.
 
     min_weights : float | dict[str, float] | array-like of shape (n_assets, ), default=0.0
-        Minimum assets weights (weights lower bounds). Negative weights are not allowed.
-        If a float is provided, it is applied to each asset. `None` is equivalent to
-        `-np.Inf` (no lower bound). If a dictionary is provided, its (key/value) pair
-        must be the (asset name/asset minium weight) and the input `X` of the `fit`
-        methods must be a DataFrame with the assets names in columns. When using a
-        dictionary, assets values that are not provided are assigned a minimum weight
-        of `0.0`. The default is 0.0 (no short selling).
+        Minimum assets weights (weights lower bounds). The default is 0.0 (no short
+        selling). Negative weights are not allowed. If a float is provided, it is
+        applied to each asset. `None` is equivalent to the default `0.0`. If a
+        dictionary is provided, its (key/value) pair must be the (asset name/asset
+        minimum weight) and the input `X` of the `fit` methods must be a DataFrame with
+        the asset names in columns. When using a dictionary, assets values that are not
+        provided are assigned the default  minimum weight of `0.0`.
 
         Example:
 
-           * min_weights = 0 --> long only portfolio (no short selling).
-           * min_weights = None --> no lower bound (same as `-np.Inf`).
-           * min_weights = {"SX5E": 0, "SPX": 0.1}
-           * min_weights = [0, 0.1]
+           * `min_weights = 0.0` --> long only portfolio (default).
+           * `min_weights = {"SX5E": 0.1, "SPX": 0.2}`
+           * `min_weights = [0.1, 0.2]`
 
     max_weights : float | dict[str, float] | array-like of shape (n_assets, ), default=1.0
-        Maximum assets weights (weights upper bounds). Weights above 1.0 are not
-        allowed. If a float is provided, it is applied to each asset. `None` is
-        equivalent to `+np.Inf` (no upper bound). If a dictionary is provided, its
-        (key/value) pair must be the (asset name/asset maximum weight) and the input `X`
-        of the `fit` method must be a DataFrame with the assets names in columns. When
-        using a dictionary, assets values that are not provided are assigned a minimum
-        weight of `1.0`. The default is 1.0 (each asset is below 100%).
+        Maximum assets weights (weights upper bounds). The default is 1.0 (each asset
+        is below 100%). Weights above 1.0 are not allowed. If a float is provided, it is
+        applied to each asset. `None` is equivalent to the default `1.0`. If a
+        dictionary is provided, its (key/value) pair must be the (asset name/asset
+        maximum weight) and the input `X` of the `fit` method must be a DataFrame with
+        the asset names in columns. When using a dictionary, assets values that are not
+        provided are assigned the default maximum weight of `1.0`.
 
         Example:
 
-           * max_weights = 0 --> no long position (short only portfolio).
-           * max_weights = 0.5 --> each weight must be below 50%.
-           * max_weights = {"SX5E": 1, "SPX": 0.25}
-           * max_weights = [1, 0.25]
+           * `max_weights = 1.0` --> each weight  must be below 100% (default).
+           * `max_weights = 0.5` --> each weight must be below 50%.
+           * `max_weights = {"SX5E": 0.8, "SPX": 0.9}`
+           * `max_weights = [0.8, 0.9]`
 
     transaction_costs : float | dict[str, float] | array-like of shape (n_assets, ), default=0.0
         Transaction costs of the assets. It is used to add linear transaction costs to
@@ -142,22 +142,26 @@ class HierarchicalRiskParity(BaseHierarchicalOptimization):
 
         .. math:: expected\_return = \mu^{T} \cdot w - total\_cost
 
-        with :math:`\mu` the vector af assets' expected returns and :math:`w` the
+        with :math:`\mu` the vector of assets' expected returns and :math:`w` the
         vector of assets weights.
 
         If a float is provided, it is applied to each asset.
         If a dictionary is provided, its (key/value) pair must be the
         (asset name/asset cost) and the input `X` of the `fit` method must be a
-        DataFrame with the assets names in columns.
+        DataFrame with the asset names in columns.
         The default value is `0.0`.
 
         .. warning::
 
             Based on the above formula, the periodicity of the transaction costs
-            needs to be homogenous to the periodicity of :math:`\mu`. For example, if
-            the input `X` is composed of **daily** returns, the `transaction_costs` need
-            to be expressed as **daily** costs.
-            (See :ref:`sphx_glr_auto_examples_1_mean_risk_plot_6_transaction_costs.py`)
+            must match the periodicity of :math:`\mu`. For example, if the input
+            `X` is composed of **daily** returns, the `transaction_costs` need to be
+            expressed as **daily** costs. A transaction cost is paid once per
+            rebalancing while a position earns its expected return on every period it
+            is held, so the one-off cost is converted by dividing it by the expected
+            investment duration (e.g. `0.001 / 21` for a 10 bps cost with daily
+            returns and a one-month expected holding period).
+            (See :ref:`Periodicity Convention <periodicity_convention>`)
 
     management_fees : float | dict[str, float] | array-like of shape (n_assets, ), default=0.0
         Management fees of the assets. It is used to add linear management fees to the
@@ -170,21 +174,24 @@ class HierarchicalRiskParity(BaseHierarchicalOptimization):
 
         .. math:: expected\_return = \mu^{T} \cdot w - total\_fee
 
-        with :math:`\mu` the vector af assets expected returns and :math:`w` the vector
+        with :math:`\mu` the vector of assets' expected returns and :math:`w` the vector
         of assets weights.
 
         If a float is provided, it is applied to each asset.
         If a dictionary is provided, its (key/value) pair must be the
         (asset name/asset fee) and the input `X` of the `fit` method must be a
-        DataFrame with the assets names in columns.
+        DataFrame with the asset names in columns.
         The default value is `0.0`.
 
         .. warning::
 
-            Based on the above formula, the periodicity of the management fees needs to
-            be homogenous to the periodicity of :math:`\mu`. For example, if the input
+            Based on the above formula, the periodicity of the management fees
+            must match the periodicity of :math:`\mu`. For example, if the input
             `X` is composed of **daily** returns, the `management_fees` need to be
-            expressed in **daily** fees.
+            expressed in **daily** fees. Unlike transaction costs, management fees
+            accrue with holding time, so a stated annual fee converts directly to the
+            return periodicity (e.g. `0.02 / 252` for a 2% annual fee on daily
+            returns).
 
         .. note::
 
@@ -199,14 +206,34 @@ class HierarchicalRiskParity(BaseHierarchicalOptimization):
         portfolio total cost. If a float is provided, it is applied to each asset.
         If a dictionary is provided, its (key/value) pair must be the
         (asset name/asset previous weight) and the input `X` of the `fit` method must
-        be a DataFrame with the assets names in columns.
+        be a DataFrame with the asset names in columns.
         The default (`None`) means no previous weights.
+        Additionally, when `fallback="previous_weights"`, failures will fall back to
+        these weights if provided.
 
-    portfolio_params :  dict, optional
-        Portfolio parameters passed to the portfolio evaluated by the `predict` and
-        `score` methods. If not provided, the `name`, `transaction_costs`,
-        `management_fees`, `previous_weights` and `risk_free_rate` are copied from the
-        optimization model and passed to the portfolio.
+    portfolio_params : dict, optional
+        Portfolio parameters forwarded to the resulting `Portfolio` in `predict`.
+        If not provided and if available on the estimator, the following
+        attributes are propagated to the portfolio by default: `name`,
+        `transaction_costs`, `management_fees`, `previous_weights` and `risk_free_rate`.
+
+    fallback : BaseOptimization | "previous_weights" | list[BaseOptimization | "previous_weights"], optional
+        Fallback estimator or a list of estimators to try, in order, when the primary
+        optimization raises during `fit`. Alternatively, use `"previous_weights"`
+        (alone or in a list) to fall back to the estimator's `previous_weights`.
+        When a fallback succeeds, its fitted `weights_` are copied back to the primary
+        estimator so that `fit` still returns the original instance. For traceability,
+        `fallback_` stores the successful estimator (or the string `"previous_weights"`)
+        and `fallback_chain_` stores each attempt with the associated outcome.
+
+    raise_on_failure : bool, default=True
+        Controls error handling when fitting fails.
+        If True, any failure during `fit` is raised immediately, no `weights_` are
+        set and subsequent calls to `predict` will raise a `NotFittedError`.
+        If False, errors are not raised; instead, a warning is emitted, `weights_`
+        is set to `None` and subsequent calls to `predict` will return a
+        `FailedPortfolio`. When fallbacks are specified, this behavior applies only
+        after all fallbacks have been exhausted.
 
     Attributes
     ----------
@@ -224,25 +251,49 @@ class HierarchicalRiskParity(BaseHierarchicalOptimization):
 
     feature_names_in_ : ndarray of shape (`n_features_in_`,)
         Names of assets seen during `fit`. Defined only when `X`
-        has assets names that are all strings.
+        has asset names that are all strings.
+
+    fallback_ : BaseOptimization | "previous_weights" | None
+        The fallback estimator instance, or the string `"previous_weights"`, that
+        produced the final result. `None` if no fallback was used.
+
+    fallback_chain_ : list[tuple[str, str]] | None
+        Sequence describing the optimization fallback attempts. Each element is a
+        pair `(estimator_repr, outcome)` where `estimator_repr` is the string
+        representation of the primary estimator or a fallback (e.g. `"EqualWeighted()"`,
+        `"previous_weights"`), and `outcome` is `"success"` if that step produced
+        a valid solution, otherwise the stringified error message. For successful
+        fits without any fallback, this is `None`.
+
+    error_ : str | list[str] | None
+        Captured error message(s) when `fit` fails. For multi-portfolio outputs
+        (`weights_` is 2D), this is a list aligned with portfolios.
+
+    Notes
+    -----
+    All estimators should specify all parameters as explicit keyword arguments in
+    `__init__` (no `*args` or `**kwargs`), following scikit-learn conventions.
 
     References
     ----------
-    .. [1] "Building diversified portfolios that outperform out of sample",
-        The Journal of Portfolio Management,
-        Marcos López de Prado (2016).
-
-    .. [2] "A robust estimator of the efficient frontier",
+    .. [1] "A robust estimator of the efficient frontier",
         SSRN Electronic Journal,
         Marcos López de Prado (2019).
 
-    .. [3] "Machine Learning for Asset Managers",
-        Elements in Quantitative Finance. Cambridge University Press,
-        Marcos López de Prado (2020).
-
-    .. [4] "A review of two decades of correlations, hierarchies, networks and
+    .. [2] "A review of two decades of correlations, hierarchies, networks and
         clustering in financial markets",
         Gautier Marti, Frank Nielsen, Mikołaj Bińkowski, Philippe Donnat (2020).
+
+    .. [3] "Portfolio Optimization: Theory and Application", Chapter 12,
+        Daniel P. Palomar (2025)
+
+    .. [4] "Building diversified portfolios that outperform out of sample",
+        The Journal of Portfolio Management,
+        Marcos López de Prado (2016).
+
+    .. [5] "Machine Learning for Asset Managers",
+        Elements in Quantitative Finance. Cambridge University Press,
+        Marcos López de Prado (2020).
     """
 
     def __init__(
@@ -257,6 +308,8 @@ class HierarchicalRiskParity(BaseHierarchicalOptimization):
         management_fees: skt.MultiInput = 0.0,
         previous_weights: skt.MultiInput | None = None,
         portfolio_params: dict | None = None,
+        fallback: skt.Fallback = None,
+        raise_on_failure: bool = True,
     ):
         super().__init__(
             risk_measure=risk_measure,
@@ -269,11 +322,11 @@ class HierarchicalRiskParity(BaseHierarchicalOptimization):
             management_fees=management_fees,
             previous_weights=previous_weights,
             portfolio_params=portfolio_params,
+            fallback=fallback,
+            raise_on_failure=raise_on_failure,
         )
 
-    def fit(
-        self, X: npt.ArrayLike, y: None = None, **fit_params
-    ) -> "HierarchicalRiskParity":
+    def fit(self, X: ArrayLike, y: None = None, **fit_params) -> HierarchicalRiskParity:
         """Fit the Hierarchical Risk Parity Optimization estimator.
 
         Parameters
@@ -296,6 +349,13 @@ class HierarchicalRiskParity(BaseHierarchicalOptimization):
             raise TypeError(
                 "`risk_measure` must be of type `RiskMeasure` or `ExtraRiskMeasure`"
             )
+
+        if self.risk_measure in [ExtraRiskMeasure.SKEW, ExtraRiskMeasure.KURTOSIS]:
+            # Because Skew and Kurtosis can take negative values
+            raise ValueError(
+                f"risk_measure {self.risk_measure} currently not supported in HRP"
+            )
+
         self.prior_estimator_ = check_estimator(
             self.prior_estimator,
             default=EmpiricalPrior(),
@@ -314,8 +374,8 @@ class HierarchicalRiskParity(BaseHierarchicalOptimization):
 
         # Fit the estimators
         self.prior_estimator_.fit(X, y, **routed_params.prior_estimator.fit)
-        prior_model = self.prior_estimator_.prior_model_
-        returns = prior_model.returns
+        return_distribution = self.prior_estimator_.return_distribution_
+        returns = return_distribution.returns
 
         # To keep the asset_names
         if isinstance(X, pd.DataFrame):
@@ -334,11 +394,11 @@ class HierarchicalRiskParity(BaseHierarchicalOptimization):
             X=distance, y=None, **routed_params.hierarchical_clustering_estimator.fit
         )
 
-        X = self._validate_data(X)
+        X = skv.validate_data(self, X)
         n_assets = X.shape[1]
 
         min_weights, max_weights = self._convert_weights_bounds(n_assets=n_assets)
-        assets_risks = self._unitary_risks(prior_model=prior_model)
+        assets_risks = self._unitary_risks(return_distribution=return_distribution)
 
         ordered_linkage_matrix = sch.optimal_leaf_ordering(
             self.hierarchical_clustering_estimator_.linkage_matrix_,
@@ -359,13 +419,15 @@ class HierarchicalRiskParity(BaseHierarchicalOptimization):
                     inv_risk_w[ids] = 1 / assets_risks[ids]
                     inv_risk_w /= inv_risk_w.sum()
                     risks.append(
-                        self._risk(weights=inv_risk_w, prior_model=prior_model)
+                        self._risk(
+                            weights=inv_risk_w, return_distribution=return_distribution
+                        )
                     )
                 left_risk, right_risk = risks
                 left_cluster, right_cluster = clusters_ids
                 alpha = 1 - left_risk / (left_risk + right_risk)
                 # Weights constraints
-                alpha = self._apply_weight_constraints_to_alpha(
+                alpha = _apply_weight_constraints_to_split_factor(
                     alpha=alpha,
                     weights=weights,
                     max_weights=max_weights,
@@ -379,3 +441,54 @@ class HierarchicalRiskParity(BaseHierarchicalOptimization):
 
         self.weights_ = weights
         return self
+
+
+def _apply_weight_constraints_to_split_factor(
+    alpha: float,
+    max_weights: FloatArray,
+    min_weights: FloatArray,
+    weights: FloatArray,
+    left_cluster: FloatArray,
+    right_cluster: FloatArray,
+) -> float:
+    """
+    Apply weight constraints to the split factor alpha of the ,Hierarchical Tree
+    Clustering algorithm.
+
+    Parameters
+    ----------
+    alpha : float
+        The split factor alpha of the Hierarchical Tree Clustering algorithm.
+
+    min_weights : ndarray of shape (n_assets,)
+        The weight lower bound 1D array.
+
+    max_weights : ndarray of shape (n_assets,)
+        The weight upper bound 1D array.
+
+    weights : FloatArray of shape (n_assets,)
+        The assets weights.
+
+    left_cluster : ndarray of shape (n_left_cluster,)
+        Indices of the left cluster weights.
+
+    right_cluster : ndarray of shape (n_right_cluster,)
+        Indices of the right cluster weights.
+
+    Returns
+    -------
+    value : float
+        The transformed split factor alpha incorporating the weight constraints.
+    """
+    alpha = min(
+        np.sum(max_weights[left_cluster]) / weights[left_cluster[0]],
+        max(np.sum(min_weights[left_cluster]) / weights[left_cluster[0]], alpha),
+    )
+    alpha = 1 - min(
+        np.sum(max_weights[right_cluster]) / weights[right_cluster[0]],
+        max(
+            np.sum(min_weights[right_cluster]) / weights[right_cluster[0]],
+            1 - alpha,
+        ),
+    )
+    return alpha
